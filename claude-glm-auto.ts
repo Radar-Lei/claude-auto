@@ -47,6 +47,14 @@ const forwardedArgs: string[] = [...cliArgs, ...permissionModeArgs(cliArgs)];
 // ==========================================
 // CONFIG
 // ==========================================
+// One scale factor for every timing constant. Production never sets it
+// (scale 1); the E2E suite runs at 0.01 so five-minute waits compress to
+// three seconds. Anything non-positive or unparseable falls back to 1.
+const TIME_SCALE: number = (() => {
+    const v: number = Number.parseFloat(process.env.CGA_TIME_SCALE ?? '1');
+    return Number.isFinite(v) && v > 0 ? v : 1;
+})();
+const scaled = (ms: number): number => Math.max(1, Math.round(ms * TIME_SCALE));
 
 // Any API error, rendered into the transcript as "● API Error: …". With GLM this
 // covers both the 5-hour-window limit (error 1308, with a reset time in the
@@ -56,8 +64,63 @@ const forwardedArgs: string[] = [...cliArgs, ...permissionModeArgs(cliArgs)];
 // Whitespace is loose because the line can be re-wrapped at narrow widths.
 const apiErrorRegex: RegExp = /●\s*API Error:/i;
 
-// How long to sit out a 529 before sending "continue" again.
-const API_ERROR_COOLDOWN_MS: number = 5 * 60 * 1000;
+// --- Error classification --------------------------------------------------
+// What a GLM limit looks like on the rendered screen. The 5-hour window
+// rejects requests with HTTP 429 + error code 1308 and a Chinese message
+// carrying the reset time (confirmed from real transcripts):
+//
+//   ● API Error: Request rejected (429) · [1308][已达到 5 小时的使用上限。
+//   您的限额将在 2026-09-07 17:00:30 重置。][...]
+//
+// The monthly allowance has its own wording (每周/每月) and its reset is the
+// *monthly* window's, days out. Both are limit-shaped: the request was
+// throttled, so "continue" before the reset would only fail again. Anything
+// else — connection closed mid-response, self-signed certificate, 529
+// overload, stream idle timeout — is transient, however full the quota reads:
+// a high percentage must never turn a transient error into a multi-hour wait.
+const LIMIT_ERROR_PATTERNS: RegExp[] = [
+    /\[?1308\]?/,                            // GLM's 5-hour window error code
+    /已达到[\s\S]{0,40}?使用上限/,             // "…使用上限…" (5-hour and monthly)
+    /usage\s+limit\s+(?:reached|exceeded)/i,  // English wording, just in case
+];
+// Which window a limit message names — its reset time is the one that counts.
+const MONTHLY_LIMIT_PATTERN: RegExp = /每周|每月/;
+// "2026-09-07 17:00:30" inside a limit message: local time on both ends — the
+// TUI renders local, we parse local — so no timezone to guess.
+const BANNER_RESET_TIME_REGEX: RegExp =
+    /(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2}):(\d{2})/;
+// Claude Code's own retry backoff, e.g. "Retrying in 32 seconds…". While it's
+// up, Claude hasn't given up on the request — sending "continue" would queue
+// text into a busy session — so a resume holds until it's gone. Best-effort
+// by design: absence of the hint doesn't prove idle, but presence reliably
+// means busy, and a held resume simply retries on its next tick.
+const RETRY_HINT_REGEX: RegExp = /retry(?:ing)?[^a-z]{0,3}in\s+\d+\s*(?:s|sec|second)/i;
+
+// Transient errors retry on a ladder: fast at first (a dropped connection is
+// usually back immediately), slower as failures stack (a broken proxy won't
+// heal in 15 seconds and hammering it helps nobody). The ladder resets only
+// after TRANSIENT_RESET_TICKS consecutive clean screen captures (2s each =
+// 10 min) — captures skipped while a wait, menu or grace period ran don't
+// count, so a pause can't age a persistent failure away.
+const TRANSIENT_DELAYS_MS: readonly number[] = [15e3, 30e3, 60e3, 120e3, 300e3].map(scaled);
+const TRANSIENT_RESET_TICKS: number = Math.max(1, Math.round(300 * TIME_SCALE));
+
+// After any resume send, error handling pauses this long: the "❯ continue"
+// echo takes a moment to render, and re-detecting the same error inside that
+// window would double-send. If the echo never lands, the first capture after
+// the grace re-triggers handling — one rung up the ladder.
+const SEND_GRACE_MS: number = scaled(5000);
+
+// A limit wait with no usable reset time (quota API down, no time in the
+// message) probes on this cadence: each round re-queries for a deadline AND
+// sends one probing "continue" — a transient error heals on the probe, a
+// true limit shrugs it off at harmless 5-minute spacing. Bounded, never a
+// silent hang.
+const PROBE_INTERVAL_MS: number = scaled(5 * 60 * 1000);
+
+// When an early resume bounces straight back into the same limit and the new
+// wait also has no deadline to trust, early resume stays off for this long.
+const EARLY_RESUME_FALLBACK_MS: number = scaled(2 * 60 * 60 * 1000);
 
 // ==========================================
 // GLM QUOTA API
@@ -87,7 +150,7 @@ const QUOTA_URL_OVERRIDE_ENV: string = 'GLM_QUOTA_URL';
 // Standing poll cadence for the title bar, and how long a request may take.
 // Five minutes matches how fast a 5-hour window visibly moves; a slow poll
 // never blocks anything (detection and resumes don't wait on it).
-const QUOTA_POLL_INTERVAL_MS: number = 5 * 60 * 1000;
+const QUOTA_POLL_INTERVAL_MS: number = scaled(5 * 60 * 1000);
 const QUOTA_FETCH_TIMEOUT_MS: number = 8000;
 
 // Consecutive failed polls back off exponentially up to this — the API is a
@@ -267,8 +330,8 @@ async function fetchQuotaSnapshot(creds: GlmCredentials): Promise<QuotaSnapshot 
 // fully rendered, then ignore it for a grace period so the redraw doesn't make
 // us press Enter twice.
 const MENU_PROMPT_TEXT: string = '❯ stop and wait for limit to reset';
-const MENU_ENTER_DELAY_MS: number = 2000;
-const MENU_GRACE_MS: number = 5000;
+const MENU_ENTER_DELAY_MS: number = scaled(2000);
+const MENU_GRACE_MS: number = scaled(5000);
 
 // When this substring is on screen the user is scrolled up through history
 // (it's the "(ctrl+End) ↓" jump-to-bottom hint). What we read in that state is
@@ -286,14 +349,14 @@ const SCROLL_INDICATOR: string = ') ↓';
 const RESUME_PROMPT_TEXT: string = '❯ resume from summary';
 
 // Safety margin added on top of the quota API's nextResetTime before we resume.
-const WAIT_BUFFER_MS: number = 60 * 1000;
+const WAIT_BUFFER_MS: number = scaled(60 * 1000);
 
 // A reset time that is already in the past still has to leave a gap before we
 // resume, or a limit that's in fact still live would spin: resume, banner,
 // re-check, resume, seconds apart. It happens when a reset has only just gone
 // by, and for as long as hours if the machine's clock is offset — nextResetTime
 // is an epoch-ms stamp, so this is the backstop for clock skew.
-const MIN_WAIT_MS: number = 5 * 60 * 1000;
+const MIN_WAIT_MS: number = scaled(5 * 60 * 1000);
 
 // The text sent to continue a session
 const RESUME_CONTINUE_TEXT: string = 'continue';
@@ -324,7 +387,7 @@ const CLEAR_INPUT_SEQUENCE: string = '\x15'.repeat(8);
 const F4_SEQUENCES: string[] = ['\x1bOS', '\x1b[14~'];
 
 // How often we snapshot the rendered screen in debug mode (and run limit detection on it).
-const SCREEN_CAPTURE_INTERVAL_MS: number = 2000;
+const SCREEN_CAPTURE_INTERVAL_MS: number = scaled(2000);
 const LOG_FILE: string = path.join(process.cwd(), 'claude-glm-auto.log');
 
 function log(msg: string): void {
@@ -872,6 +935,7 @@ async function pollQuota(): Promise<void> {
         if (tokens.percentage >= QUOTA_WARN_PCT) {
             log(`5-hour window at ${tokens.percentage}% — closing on the limit`);
         }
+        considerEarlyResume(tokens);
     }
     renderTitle();
     scheduleNextPoll(QUOTA_POLL_INTERVAL_MS);
@@ -940,17 +1004,19 @@ if (process.stdin.isTTY) {
 }
 process.stdin.resume();
 
-// Forward everything the user types straight to Claude. The one exception: while
-// a countdown is running, F4 cancels it (and is swallowed so it never reaches
-// Claude). When no countdown is active, F4 passes through untouched.
+// Forward everything the user types straight to Claude, with one rule while
+// an auto-resume is pending: any key means the user is driving now — the
+// pending wait is cancelled so our Ctrl-U+continue can never wipe a draft
+// they're typing. F4 (swallowed, never forwarded) does the same on purpose.
 process.stdin.on('data', (data: string) => {
     if (isWaiting && F4_SEQUENCES.some(seq => data.includes(seq))) {
-        cancelCountdown();
         let rest = data;
         for (const seq of F4_SEQUENCES) rest = rest.split(seq).join('');
+        cancelAllWaits('F4');
         if (rest.length > 0) ptyProcess.write(rest);
         return;
     }
+    if (isAutoResumePending()) cancelAllWaits('user input');
     ptyProcess.write(data);
 });
 
@@ -1027,6 +1093,15 @@ function cleanup(): void {
         clearInterval(countdownInterval);
         countdownInterval = null;
     }
+    resumeEpoch++; // retire any in-flight query or callback
+    if (transientTimer) {
+        clearTimeout(transientTimer);
+        transientTimer = null;
+    }
+    if (probeTimer) {
+        clearTimeout(probeTimer);
+        probeTimer = null;
+    }
     stopQuotaPolling();
     restoreTitle();
     try { if (process.stdin.isTTY) process.stdin.setRawMode(false); } catch { /* terminal already gone */ }
@@ -1088,6 +1163,17 @@ main();
 
 function onScreenCapture(): void {
     logScreen();
+    // Ticks only count toward the transient-ladder reset when error handling
+    // is actually live: ticks skipped by a wait, menu or send grace can't age
+    // a failure out, and neither can the send-grace window itself.
+    if (!isAutoResumePending() && !isVerifying && !isHandlingMenu && Date.now() >= resumeSentGraceUntil) {
+        cleanCaptureTicks++;
+        if (transientTier > 0 && cleanCaptureTicks >= TRANSIENT_RESET_TICKS) {
+            transientTier = 0;
+            lastResumeWasEarly = false; // a bounced early resume is old news by now
+            log('10 minutes clean — transient retry ladder reset');
+        }
+    }
     detectLimit(currentScreen);
 }
 
@@ -1165,10 +1251,239 @@ function detectLimit(screen: string): void {
     handleApiError(screen);
 }
 
-// A 529 is transient, so there is no panel to confirm it against — the screen is
-// the whole evidence. It goes through the same guards as a limit banner
-// (scrolled-up history, the resume question, the wait-for-reset menu, and the
-// staleness test), then just waits it out.
+// ==========================================
+// ERROR → RESUME MACHINERY
+// ==========================================
+// Every stop is an "● API Error:" line. The flow: classify (limit-shaped vs
+// transient), then either wait out a deadline or climb the transient ladder,
+// then send "continue" through one outlet. Recovery sources — a deadline
+// firing, an early-resume poll, a transient timer, a probe — all funnel into
+// trySendResume(), and a generation counter (resumeEpoch) retires results
+// that arrive after their wait was cancelled (F4, user takeover, exit).
+
+// How much of the error line to scan: the message can wrap across narrow
+// widths, so classification reads a window from the match, not one line.
+const ERROR_TAIL_CHARS: number = 240;
+
+let resumeEpoch: number = 0;           // bumped on cancel/exit; retires stale async work
+let quotaApiRetryUntil: number = 0;    // no error-triggered API query before this
+let resumeSentGraceUntil: number = 0;  // a resume just went out; let its echo land
+let transientTimer: NodeJS.Timeout | null = null;
+let transientTier: number = 0;         // rung on TRANSIENT_DELAYS_MS (0 = first failure)
+let cleanCaptureTicks: number = 0;     // consecutive captures with no new error event
+let probeTimer: NodeJS.Timeout | null = null;
+let limitDeadline: number | null = null; // epoch ms; null = probing without one
+let waitStartedAt: number = 0;
+let limitWaitMonthly: boolean = false; // the wait is for the monthly allowance
+let windowHighSeen: boolean = false;   // the window verifiably read spent (or 1308 said so)
+let lowStreak: number = 0;             // consecutive polls reading below the confirm line
+let earlyResumeDisabledUntil: number = 0; // an early resume bounced: deadlines only
+let lastResumeWasEarly: boolean = false;
+
+function isAutoResumePending(): boolean {
+    return isWaiting || transientTimer !== null || probeTimer !== null;
+}
+
+// Tear down an in-progress limit wait (countdown or probe loop), restoring
+// detection and the title. The epoch bump retires this wait's in-flight
+// queries and callbacks.
+function endLimitWait(): void {
+    if (countdownInterval) {
+        clearInterval(countdownInterval);
+        countdownInterval = null;
+    }
+    if (probeTimer) {
+        clearTimeout(probeTimer);
+        probeTimer = null;
+    }
+    if (isWaiting) resumeEpoch++;
+    isWaiting = false;
+    limitDeadline = null;
+    restoreTitle(); // no-op unless the wait had taken the title
+}
+
+// F4, or any user keystroke while something is pending: the user is driving
+// now. Cancels every pending auto-resume — limit wait, transient timer,
+// probe — and re-arms detection so the same error can be acted on afresh.
+function cancelAllWaits(reason: string): void {
+    resumeEpoch++;
+    endLimitWait();
+    if (transientTimer) {
+        clearTimeout(transientTimer);
+        transientTimer = null;
+    }
+    log(`Auto-resume cancelled (${reason}) — detection re-armed`);
+}
+
+// The single place a "continue" goes out. Returns false — without sending —
+// when Claude can't take input right now (resume question, wait-for-reset
+// menu, its own retry backoff), so the caller's own tick tries again: that's
+// why a countdown keeps ticking past its deadline while a hold is up.
+// Sending is: clear the composer, type "continue", Enter. The echo that
+// follows is what retires the error we acted on (see RESUME_CONTINUE_MARKER).
+function trySendResume(reason: string): boolean {
+    if (Date.now() < resumeSentGraceUntil) return false;
+
+    const screen: string = captureScreen();
+    if (hasResumePrompt(screen)) {
+        log(`Resume due (${reason}) but the resume-from-summary question is up — holding`);
+        return false;
+    }
+    if (screen.toLowerCase().includes(MENU_PROMPT_TEXT)) {
+        log(`Resume due (${reason}) but the wait-for-reset menu is up — holding`);
+        return false;
+    }
+    if (RETRY_HINT_REGEX.test(screen)) {
+        log(`Resume due (${reason}) but Claude is retrying on its own — holding`);
+        return false;
+    }
+
+    if (isWaiting) endLimitWait();
+    ptyProcess.write(CLEAR_INPUT_SEQUENCE + RESUME_CONTINUE_TEXT + '\r');
+    resumeSentGraceUntil = Date.now() + SEND_GRACE_MS;
+    log(`Sending "${RESUME_CONTINUE_TEXT}" (${reason})`);
+    return true;
+}
+
+// The reset time inside a limit message, as local-time epoch ms, or null.
+function parseBannerResetTime(tail: string): number | null {
+    const m: RegExpMatchArray | null = tail.match(BANNER_RESET_TIME_REGEX);
+    if (m === null) return null;
+    const t: number = new Date(
+        parseInt(m[1]!, 10), parseInt(m[2]!, 10) - 1, parseInt(m[3]!, 10),
+        parseInt(m[4]!, 10), parseInt(m[5]!, 10), parseInt(m[6]!, 10),
+    ).getTime();
+    return Number.isNaN(t) ? null : t;
+}
+
+// A 529 or any other non-limit failure: nothing to confirm against and
+// nothing to wait for — the ladder paces the retries.
+function scheduleTransientRetry(tail: string): void {
+    const delay: number = TRANSIENT_DELAYS_MS[transientTier]!;
+    transientTier = Math.min(transientTier + 1, TRANSIENT_DELAYS_MS.length - 1);
+    const gist: string = tail.replace(/\s+/g, ' ').slice(0, 80);
+    log(`Transient API error ("${gist}") — continuing in ${Math.round(delay / 1000)}s`);
+    transientTimer = setTimeout(() => {
+        transientTimer = null;
+        trySendResume('transient');
+    }, delay);
+}
+
+// Enter a limit wait. A known deadline counts down to it; a missing one runs
+// a probe loop instead — bounded, never a silent hang. The floor is applied
+// once, here: a deadline already in the past (clock skew, a window that
+// shifted while we queried) still leaves MIN_WAIT_MS before the resume, and
+// later information replaces the deadline rather than re-flooring it.
+function startLimitWait(deadline: number | null, monthly: boolean): void {
+    const now: number = Date.now();
+    if (deadline !== null && deadline < now + MIN_WAIT_MS) deadline = now + MIN_WAIT_MS;
+
+    limitDeadline = deadline;
+    waitStartedAt = now;
+    limitWaitMonthly = monthly;
+    lowStreak = 0;
+    windowHighSeen = true; // the banner itself: this request was throttled
+
+    isWaiting = true;
+    titleOverridden = true;
+
+    if (deadline !== null) {
+        log(`Limit wait until ${new Date(deadline).toLocaleString()}` +
+            (monthly ? ' (monthly allowance)' : ' (5-hour window)'));
+        startCountdownTicks();
+        return;
+    }
+    log('Limit-shaped error with no usable reset time — probing for one');
+    scheduleProbe();
+}
+
+function startCountdownTicks(): void {
+    countdownInterval = setInterval(() => {
+        const remainingMs: number = (limitDeadline ?? 0) - Date.now();
+
+        if (remainingMs > 0) {
+            const totalSeconds: number = Math.floor(remainingMs / 1000);
+            const h: number = Math.floor(totalSeconds / 3600);
+            const m: number = Math.floor((totalSeconds % 3600) / 60);
+            const s: number = totalSeconds % 60;
+            const timeStr: string = `${h > 0 ? h + 'h ' : ''}${m}m ${s}s`;
+            setTitle(`⏳ GLM resumes: ${timeStr}`);
+            return;
+        }
+
+        // Due. A hold (question, menu, Claude retrying) returns false and the
+        // next tick tries again; a real send tears the wait down on its own.
+        if (trySendResume('deadline') && countdownInterval) {
+            clearInterval(countdownInterval);
+            countdownInterval = null;
+        }
+    }, 1000);
+}
+
+// No deadline: every PROBE_INTERVAL_MS, re-query for a reset time (an upgrade
+// to a real countdown) and send one probing "continue". If the quota API is
+// down too, the probe still goes out alone — a transient error heals on it,
+// and a true limit can only fail it.
+function scheduleProbe(): void {
+    if (probeTimer !== null) clearTimeout(probeTimer);
+    probeTimer = setTimeout(() => {
+        probeTimer = null;
+        if (!isWaiting) return;
+        const myEpoch: number = resumeEpoch;
+        void (async (): Promise<void> => {
+            if (glmCredentials !== null) {
+                const snap: QuotaSnapshot | null = await fetchQuotaSnapshot(glmCredentials);
+                if (resumeEpoch !== myEpoch) return;
+                const window: QuotaWindow | null = snap?.tokens ?? null;
+                if (window !== null && window.nextResetTime !== null) {
+                    let deadline: number = window.nextResetTime + WAIT_BUFFER_MS;
+                    if (deadline < Date.now() + MIN_WAIT_MS) deadline = Date.now() + MIN_WAIT_MS;
+                    log(`Probe found a reset time — counting down to ${new Date(deadline).toLocaleTimeString()}`);
+                    limitDeadline = deadline;
+                    if (probeTimer !== null) {
+                        clearTimeout(probeTimer);
+                        probeTimer = null;
+                    }
+                    startCountdownTicks();
+                    return;
+                }
+            }
+            if (resumeEpoch !== myEpoch || !isWaiting) return;
+            trySendResume('probe');
+            if (isWaiting) scheduleProbe(); // a held send tries again next round
+        })();
+    }, PROBE_INTERVAL_MS);
+}
+
+// A fresh reading arrived while a limit wait runs. The 5-hour window reading
+// back below the confirm line — twice, if no spent reading was ever seen —
+// means capacity is back (old tokens aged out ahead of the deadline); resume
+// now rather than waiting the clock out. Monthly waits ignore this: their
+// window is the monthly one, and the 5-hour reading says nothing about it.
+function considerEarlyResume(tokens: QuotaWindow): void {
+    if (!isWaiting || limitWaitMonthly) return;
+    if (Date.now() < earlyResumeDisabledUntil) return;
+    if (Date.now() - waitStartedAt < MIN_WAIT_MS) return;
+
+    if (tokens.percentage >= LIMIT_CONFIRM_PCT) {
+        windowHighSeen = true;
+        lowStreak = 0;
+        return;
+    }
+    lowStreak++;
+    if (lowStreak < (windowHighSeen ? 1 : 2)) return;
+
+    log(`5-hour window back down to ${tokens.percentage}% — resuming early`);
+    if (trySendResume('quota-early')) {
+        lastResumeWasEarly = true;
+    }
+}
+
+// Classify a live API error and start the right kind of wait. Screen evidence
+// leads: a limit-shaped banner puts us in a limit wait whatever the quota API
+// says, and a non-limit banner climbs the transient ladder however full the
+// window reads. Inside a limit wait the quota API's job is only to supply the
+// precise deadline and, later, the early-resume signal.
 function handleApiError(screen: string): void {
     const error = lastMatch(screen, apiErrorRegex);
     if (error === null) return;
@@ -1177,67 +1492,60 @@ function handleApiError(screen: string): void {
         log('API error sits above a resume we already sent — ignoring as stale');
         return;
     }
+    // A pending wait/timer owns this error already, and a just-sent resume is
+    // waiting for its echo — neither needs a second claim.
+    if (isAutoResumePending() || Date.now() < resumeSentGraceUntil) return;
 
-    log(`API error 529 on screen — retrying in ${API_ERROR_COOLDOWN_MS / 60000} min`);
-    startCountdown(Date.now() + API_ERROR_COOLDOWN_MS);
-}
+    cleanCaptureTicks = 0; // a new error event ends any clean run
+    const tail: string = screen.slice(error.index, error.index + ERROR_TAIL_CHARS);
+    const isLimit: boolean = LIMIT_ERROR_PATTERNS.some(re => re.test(tail));
 
-// Wait until `targetTimeMs`, then send "continue". The target is either the
-// quota API's nextResetTime (plus buffer) or a short cooldown for a transient
-// error. From here until we resume, detection is paused (isWaiting).
-function startCountdown(targetTimeMs: number): void {
-    isWaiting = true;
-
-    // From here on the title is ours; restoreTitle() hands it back.
-    titleOverridden = true;
-
-    log(`Resuming at ${new Date(targetTimeMs).toLocaleString()}`);
-
-    countdownInterval = setInterval(() => {
-        const remainingMs = targetTimeMs - Date.now();
-
-        if (remainingMs > 0) {
-            const totalSeconds = Math.floor(remainingMs / 1000);
-            const h = Math.floor(totalSeconds / 3600);
-            const m = Math.floor((totalSeconds % 3600) / 60);
-            const s = totalSeconds % 60;
-            const timeStr = `${h > 0 ? h + 'h ' : ''}${m}m ${s}s`;
-            setTitle(`⏳ Claude Resumes: ${timeStr}`);
-            return;
-        }
-
-        // Quota should be back, but the resume-from-summary question is up: our
-        // Enter would answer it. Hold the countdown open and try again next tick,
-        // so the session resumes the moment the user has answered.
-        if (hasResumePrompt(captureScreen())) {
-            log('Timer elapsed but resume-from-summary question is up — holding');
-            setTitle('⏳ Claude Resumes: waiting for your answer');
-            return;
-        }
-
-        clearInterval(countdownInterval!);
-        countdownInterval = null;
-        isWaiting = false;
-        // Hand the title back to Claude and resume the session.
-        restoreTitle();
-        // "continue" lands in the transcript just below the banner we waited out,
-        // which is what stops detectLimit re-reading that stale banner (see
-        // RESUME_CONTINUE_MARKER). If the reset was early and the limit is still
-        // live, the next banner renders below this continue and is verified.
-        log('Timer elapsed — sending "continue" to resume');
-        ptyProcess.write(CLEAR_INPUT_SEQUENCE + RESUME_CONTINUE_TEXT + '\r');
-    }, 1000);
-}
-
-// Cancel an in-progress countdown (triggered by F4). Clears the disproof and
-// backoff state so the very same limit can be detected again immediately.
-function cancelCountdown(): void {
-    if (countdownInterval) {
-        clearInterval(countdownInterval);
-        countdownInterval = null;
+    if (!isLimit) {
+        scheduleTransientRetry(tail);
+        return;
     }
-    restoreTitle();
-    isWaiting = false;
-    log('Countdown cancelled (F4) — detection re-armed');
+
+    // Limit-shaped: resolve the best deadline — quota API first (precise; the
+    // monthly window if the message names it), then the banner's own time,
+    // then none (probe loop).
+    isVerifying = true;
+    const myEpoch: number = resumeEpoch;
+    void (async (): Promise<void> => {
+        try {
+            const monthly: boolean = MONTHLY_LIMIT_PATTERN.test(tail);
+            let deadline: number | null = null;
+
+            if (glmCredentials !== null && Date.now() >= quotaApiRetryUntil) {
+                const snap: QuotaSnapshot | null = await fetchQuotaSnapshot(glmCredentials);
+                if (resumeEpoch !== myEpoch) return;
+                if (snap === null) {
+                    quotaApiRetryUntil = Date.now() + QUOTA_RETRY_AFTER_FAIL_MS;
+                    log('quota API unusable while confirming a limit — falling back');
+                } else {
+                    const window: QuotaWindow | null = monthly ? snap.monthly : snap.tokens;
+                    if (window !== null && window.nextResetTime !== null) {
+                        deadline = window.nextResetTime + WAIT_BUFFER_MS;
+                    }
+                }
+            }
+            if (resumeEpoch !== myEpoch) return;
+            if (deadline === null) {
+                const bannerTime: number | null = parseBannerResetTime(tail);
+                if (bannerTime !== null) deadline = bannerTime + WAIT_BUFFER_MS;
+            }
+
+            // An early resume that bounced straight back means the window
+            // wasn't really clear: this wait trusts only its hard deadline.
+            if (lastResumeWasEarly) {
+                lastResumeWasEarly = false;
+                earlyResumeDisabledUntil = deadline ?? (Date.now() + EARLY_RESUME_FALLBACK_MS);
+                log(`Early resume bounced — early resume off until ${new Date(earlyResumeDisabledUntil).toLocaleTimeString()}`);
+            }
+
+            startLimitWait(deadline, monthly);
+        } finally {
+            isVerifying = false;
+        }
+    })();
 }
 

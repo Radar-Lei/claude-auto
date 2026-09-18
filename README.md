@@ -1,266 +1,211 @@
 <div align="center">
 
-# claude-auto: auto-continue for Claude Code
-![⏳ Claude Resumes: 2h 14m 08s](https://i.imgur.com/2braByb.gif)
+# claude-glm-auto: auto-continue for Claude Code on GLM
 
-**Hit your session limit? Go do something else.**
+**Hit the 5-hour limit? Connection dropped mid-task? Go do something else.**
 <br>
-`claude-auto` automatically waits out the reset and continues right where you left off.
+`claude-glm-auto` watches your GLM quota through the official API, waits out the
+reset, and continues right where you left off.
 
-
-[![npm](https://img.shields.io/npm/v/@hotox/claude-auto.svg)](https://www.npmjs.com/package/@hotox/claude-auto)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](#platform-support)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
 
-`claude-auto` is a transparent wrapper around the [Claude Code](https://claude.com/claude-code)
-CLI. It runs `claude` inside a pseudo-terminal and forwards your keystrokes and
-Claude's output untouched, so the TUI looks and behaves **exactly** as it always has.
-
-The difference: when Claude stops — because you've hit a usage limit (session,
-weekly, or monthly spend), or because it parked the session at a **checkpoint**
-just short of one — `claude-auto` sends a quick `/usage` command to confirm it,
-counts the wait down in your window title, and sends `continue`
-the moment your quota is back. And where Claude offers `/low-priority` — keep
-going now, on spare capacity — it takes that instead of waiting at all. No
-babysitting, no lost context.
-
-The package is published to npm as [`@hotox/claude-auto`](https://www.npmjs.com/package/@hotox/claude-auto).
-
----
 </div>
+
+`claude-glm-auto` is a transparent wrapper around the [Claude Code](https://claude.com/claude-code)
+CLI for people running it on **GLM** (Zhipu `open.bigmodel.cn` / `api.z.ai`, the
+Anthropic-compatible endpoint). It runs `claude` inside a pseudo-terminal and
+forwards your keystrokes and Claude's output untouched, so the TUI looks and
+behaves **exactly** as it always has.
+
+The difference is what happens when the session stops:
+
+- **The 5-hour token window is spent** (GLM rejects requests with error `1308`):
+  the wrapper reads the exact reset time from GLM's quota API, counts the wait
+  down in your window title, and sends `continue` the moment the quota is back.
+- **A transient error** — `Connection closed mid-response`, self-signed
+  certificate trouble, overload: it sends `continue` on a short retry ladder
+  (15 s, 30 s, 1 min, 2 min, 5 min), so a dropped response costs seconds, not a
+  babysitter.
+- **All the while**, the title bar shows where the 5-hour window stands —
+  `GLM 5h 64% →1h 58m` — polled from the quota API every five minutes.
+
+This is a fork of [Darkblader24/claude-auto](https://github.com/Darkblader24/claude-auto)
+rebuilt around GLM's quota API: the upstream's `/usage` panel scraping, limit
+banner wordings, checkpoints and `/low-priority` handling are gone, replaced by
+ground truth from the API your Claude Code is already authenticated with.
+
+
+## Prerequisites
+
+Claude Code must already be running on GLM. The wrapper reads its credentials
+the same way Claude Code does:
+
+1. exported `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` win if set;
+2. otherwise the `env` block of `$CLAUDE_CONFIG_DIR/settings.json`
+   (default `~/.claude/settings.json`) — e.g. the GLM profile at
+   `~/.claude_glm/settings.json`:
+
+   ```jsonc
+   {
+     "env": {
+       "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
+       "ANTHROPIC_AUTH_TOKEN": "<your GLM key>"
+     }
+   }
+   ```
+
+The token is only ever sent to the quota endpoint on the same host, and never
+appears in logs or error messages. Without credentials the wrapper still works
+as a plain passthrough — the quota features just stay off.
 
 
 ## Install
 
-```bash
-npm install -g @hotox/claude-auto
-```
-
-<details>
-<summary>More package managers</summary>
+From source (this fork isn't on npm):
 
 ```bash
-bun add -g @hotox/claude-auto
-pnpm add -g @hotox/claude-auto
-yarn global add @hotox/claude-auto
+git clone https://github.com/Radar-Lei/claude-auto.git
+cd claude-auto
+bun install && bun run build
+npm link        # or: bun link
 ```
 
-</details>
-
-Or run it without installing anything — handy for trying it once:
+Then alias it so `claude` always starts it:
 
 ```bash
-npx @hotox/claude-auto      # or: bunx @hotox/claude-auto
+claude-glm-auto --install-alias     # --uninstall-alias to undo it
 ```
 
-Note that `npx`/`bunx` re-resolve the package on each run, so they're slower to
-start than a global installation, and they can't be aliased to `claude`, but it uses the
-latest version of `claude-auto` on every run.
+It writes the alias into your shell's startup file (`~/.zshrc`, `~/.bashrc`,
+`config.fish`, PowerShell's `$PROFILE` — it picks the right one and tells you
+which). Safe to re-run. Open a new shell afterwards.
 
-
-### Updating
-
-npm never updates a global install on its own, so you stay on the version you
-installed until you say otherwise:
-
-```bash
-npm install -g @hotox/claude-auto@latest
-```
-
-`claude-auto` checks for a new version once a day in the background and, if one
-exists, prints a one-line reminder **after Claude exits** — never during a
-session, where it would corrupt the TUI. Set `CLAUDE_AUTO_NO_UPDATE_CHECK=1` to
-turn the check off entirely.
+> Migrating from upstream `claude-auto`? Run `claude-auto --uninstall-alias`
+> first — the alias markers differ, so the old block wouldn't be removed by the
+> new one.
 
 
 ## Usage
 
-`claude-auto` is a **drop-in replacement** for `claude`. All user arguments are forwarded directly to the real CLI:
+`claude-glm-auto` is a **drop-in replacement** for `claude`. All user arguments
+are forwarded directly to the real CLI:
 
 ```bash
-claude-auto                         # same as `claude`
-claude-auto -p "explain this"       # same as `claude -p "explain this"`
-claude-auto --permission-mode plan  # same as `claude --permission-mode plan`
+claude-glm-auto                         # same as `claude`
+claude-glm-auto -p "explain this"       # same as `claude -p "explain this"`
+claude-glm-auto --permission-mode plan  # same as `claude --permission-mode plan`
 ```
-
-### Aliasing it to `claude`
-
-To make `claude` always start `claude-auto` automatically:
-
-```bash
-claude-auto --install-alias     # --uninstall-alias to undo it
-```
-
-It writes the alias into your shell's startup file (`~/.zshrc`, `~/.bashrc`,
-`config.fish`, PowerShell's `$PROFILE`. it picks the right one and tells you
-which), so every new shell has it. Safe to re-run. Open a new shell afterwards.
-
-Not supported for `cmd.exe`: `doskey` has no startup file, so a permanent macro
-needs a registry key that runs for every `cmd` session on the machine. Use
-PowerShell.
-
 
 ### Auto mode
 
-`claude-auto` sessions start automatically in auto mode. A wrapper whose whole
-job is to keep working while you're away shouldn't then stop to ask permission
-for every tool call, so `claude-auto` passes `--permission-mode auto` for you.
+Sessions start with `--permission-mode auto` passed for you — a wrapper whose
+whole job is to keep working while you're away shouldn't stop to ask permission
+for every tool call. Override with `--no-auto-mode`, an explicit
+`--permission-mode`, or `--dangerously-skip-permissions`.
 
-Here are three ways to override this:
+### Cancelling / taking over
+
+- <kbd>F4</kbd> while a countdown runs cancels it and hands the session back to
+  you; detection re-arms immediately.
+- **Any other key while an auto-resume is pending does the same** — if you're
+  typing, you're driving, and the wrapper will never send `continue` (or wipe
+  your draft) from under you.
+
+### Checking your quota
+
+```bash
+claude-glm-auto --glm-quota
+```
 
 ```
-claude-auto --no-auto-mode                   # starts Claude using the default mode
-claude-auto --permission-mode plan           # starts in any mode (here in plan mode)
-claude-auto --dangerously-skip-permissions
+GLM quota (open.bigmodel.cn, fetched 11:10:08 PM)
+  5h token window : 82% used, resets 9/19/2026, 1:58:04 AM (2h 48m from now)
+  MCP monthly     : 12% used (511/4000 calls), resets 10/16/2026, 1:08:43 PM
 ```
 
 
-### Cancelling a countdown
+## The title bar
 
-Press <kbd>F4</kbd> while a countdown is running to cancel it and hand the
-session back to you. Detection re-arms immediately, so the same limit can be
-picked up again.
-- On macOS, <kbd>F4</kbd> is a system key unless `Use F1, F2, etc. keys as
-  standard function keys` is enabled in Settings, so countdown cancelling may
-  not reach the wrapper.
+| What you see | What it means |
+|:--|:--|
+| `✳ working · GLM 5h 64% →1h 58m` | window 64% spent; `→` is the next window shift — when the oldest tokens age out. During a limit wait that moment *is* the resume time |
+| `GLM 5h 91% ⚠ →0h 23m` | ≥85% spent — heads-up that a limit is close |
+| `GLM 5h 64%? →1h 58m` | last good reading, but the latest poll failed |
+| `… · MCP 91%` | the monthly MCP-tool allowance is ≥90% spent (it never blocks the model itself, so it's only ever shown) |
+| `⏳ GLM resumes: 1h 23m 45s` | a limit wait is running; at zero the session continues on its own |
 
-
-## License
-
-[MIT](LICENSE) © Philipp Köhler
-
----
-
-<details>
-<summary>Dev Notes</summary>
-
-### Flags
-
-`claude-auto` owns these flags. None of them reach `claude`; everything else you
-pass goes to it verbatim.
-
-| Flag                | Effect                                                                           |
-|:--------------------|:---------------------------------------------------------------------------------|
-| `--no-auto-mode`    | Don't pass `--permission-mode auto`. Makes it start in claude's own default mode |
-| `--install-alias`   | Write `claude` → `claude-auto` into your shell's startup file                    |
-| `--uninstall-alias` | Remove that alias again                                                          |
-| `--auto-debug`      | Append rendered-screen snapshots and detection decisions to `claude-auto.log`    |
-
-The first two are stripped before forwarding and the session runs as usual. The
-alias flags don't start a session at all: they edit the file, report what they
-did, and exit.
-
-### Environment variables
-
-| Variable                      | Effect                                                           |
-|:------------------------------|:-----------------------------------------------------------------|
-| `CLAUDE_AUTO_NO_UPDATE_CHECK` | Set to `1` to disable the daily update check and the exit notice |
 
 ## How auto-resume works
 
-Every 2 seconds, `claude-auto` snapshots the **rendered screen**, the grid of
-characters actually on display, mirrored into a headless
-[xterm](https://github.com/xtermjs/xterm.js), rather than the raw escape-sequence
-stream. That means it sees what you see, and isn't fooled by redraws, spinners,
-or partial writes.
+Every 2 seconds the wrapper snapshots the **rendered screen** (mirrored into a
+headless [xterm](https://github.com/xtermjs/xterm.js), so it sees what you see,
+unfooled by redraws and spinners). Independently, every 5 minutes it polls
+`GET /api/monitor/usage/quota/limit` on the API host with the same token
+Claude Code uses.
 
-A **limit banner** is any of the wordings Claude uses to say you're out of quota —
-"You've hit your session limit ∙ resets 11:50am", "You've hit your weekly limit" and
-"You've hit your monthly spend limit" today. They're aliases of each other: whichever appears, the handling below is
-identical. New wordings are a one-line addition to `LIMIT_PATTERNS` in `claude-auto.ts`.
+Every stop is an `● API Error:` line, and **screen evidence classifies it**:
 
-When a limit banner appears:
+1. **Limit-shaped** — the message matches GLM's limit wording (`[1308]`,
+   `已达到…使用上限`, `usage limit reached`; the monthly variant `每周/每月`
+   selects the monthly window's reset). The wait's deadline comes from the
+   quota API's `nextResetTime` (precise, epoch-ms), falling back to the reset
+   time inside the message, falling back to a 5-minute probe loop that keeps
+   re-querying *and* keeps probing with `continue` — a bounded loop, never a
+   silent hang.
+2. **Transient** — everything else (`Connection closed mid-response`,
+   self-signed certificate, 529, stream idle timeout…), *however full the
+   quota reads*: a high percentage never turns a transient error into a
+   multi-hour wait. It retries on the 15 s → 5 min ladder, which resets after
+   ten clean minutes.
 
-1. **If Claude is offering its "Stop and wait for limit to reset" menu**, it
-   selects that option for you.
-2. **If Claude is offering `/low-priority`**, it takes the offer instead of
-   waiting. Newer Claude Code builds print a line beneath the limit —
-   `⚠ /low-priority to continue now at lower priority · uses your weekly limit` —
-   and where that's on screen there's nothing to wait for: `claude-auto` submits
-   the command and the session carries straight on, out of your weekly quota. No
-   `/usage` read either, since the offer is only ever printed beside a limit
-   that's blocking right now. The command is a *toggle*, so it's only ever sent
-   once per limit: Claude's echo of it (`❯ /low-priority`) marks everything above
-   it as handled, exactly the way the `continue` from a countdown does.
-3. **Otherwise it confirms the limit against `/usage`.** It opens Claude's
-   `/usage` panel and reads the two bars that can stop a session: *Current
-   session* and *Current week (all models)*, each one's percent used and reset
-   time. Only a bar at **100% used** confirms the limit, so a stale banner on
-   screen can't trigger a false positive — and a banner is only written off as
-   stale when *neither* bar is spent. If the window is too small to show both
-   blocks, the panel is scrolled step by step until they've been read. Then the
-   panel is closed with Esc.
-4. **Then it waits.** It counts down to the reset time reported by `/usage`
-   (plus a one-minute safety buffer) — more precise than the rounded time in the
-   banner, and the only source when the banner carries no time at all — showing
-   the remaining time in your window title, and sends `continue` when the clock
-   runs out. When both bars are spent it waits for the later of the two, since
-   resuming while the weekly quota is still gone would only hit the limit again.
+During a limit wait the poll keeps running, and two things can end the wait
+early or hold it:
 
-**Checkpoints** are the other way a session stops. Rather than running you into
-the hard limit, Claude now usually stops near the top of the window and writes a
-line like `● Checkpoint …`; the older `● Claude usage limit reached` wording has
-the same shape. Any line that *starts* with the assistant bullet and carries one
-of the phrases in `CHECKPOINT_PHRASES` (`checkpoint`, `usage limit` today) counts
-as one — adding a wording is a one-line change there.
+- **Early resume**: the 5-hour window reading back below 95% (twice, if no
+  spent reading was ever seen) means old tokens aged out ahead of the deadline
+  — resume now. An early resume that bounces straight back into the same limit
+  disables early resume for that window; only the hard deadline is trusted.
+- **Holds**: at resume time, a resume-from-summary question, the
+  wait-for-reset menu, or Claude retrying on its own all hold the send; it
+  goes out the moment the hold clears.
 
-A checkpoint runs through everything above unchanged — the same staleness test,
-the same `/low-priority` shortcut, the same disproof memo, the same `/usage`
-panel read, the same countdown — with
-one difference: it fires *before* the session is spent, so the 100% rule would
-never confirm it. The **Current session** bar only has to read **95% used**
-(`CHECKPOINT_CONFIRM_PCT`). Below that, the line is written off as stale and
-ignored, exactly like a disproved banner. The weekly bar still has to read 100%,
-so a week sitting at 96% can't park the wrapper for days over a limit that isn't
-blocking anything.
+All recovery paths — deadline, early resume, ladder, probe — funnel through a
+single send outlet with a post-send grace, so two sources firing together
+can't double-send, and a keystroke or <kbd>F4</kbd> retires every pending
+callback at once.
 
-Because the phrase only has to appear on a bulleted line, a tool call that
-happens to mention it (`● Bash(grep -n "checkpoint" …)`) is a possible false
-positive. It costs one `/usage` check, which disproves it — and the disproof is
-remembered, so it stays quiet from then on.
+**The guarantee, stated honestly**: while the wrapper process is alive, the
+terminal is interactive, and your credentials are valid, a spent 5-hour window
+*will* trigger a resume attempt at its reset (or earlier, if the window
+clears), and a resume that fails again is simply handled again. Quota coming
+back doesn't promise the network, the proxy, or the certificate recovered too
+— those the ladder will keep working on at bounded pace.
 
-**Overload errors** (`● API Error: 529`) are handled the same way, minus the
-verification: there's no quota involved, so there's nothing `/usage` could
-confirm. `claude-auto` just counts down five minutes and sends `continue`. If the
-error comes back, so does the countdown. A limit banner and a checkpoint both
-take precedence — when you're out of quota, retrying in five minutes would only
-hit the limit again.
+Further details:
 
-Some more details:
+- Detection is skipped while you're scrolled up through history (stale) or
+  while Claude asks whether to resume from a summary (your call, nothing is
+  typed).
+- An error with our `❯ continue` below it is scrollback, never re-handled; a
+  genuinely new error renders below that and is acted on afresh.
+- The monthly MCP allowance (`TIME_LIMIT`) is displayed, never waited on: when
+  it's spent only MCP tool calls fail, the model keeps running.
+- Multiple concurrent sessions share one quota pool and each waits on its own;
+  they don't coordinate.
+- Node's `fetch` doesn't read `HTTP_PROXY` — the quota API is reached
+  directly. Fine for direct connections to `open.bigmodel.cn`.
+- Nothing is ever written to stdout/stderr during a session (it would corrupt
+  the TUI); diagnostics go to the optional `--auto-debug` log.
 
-- Detection is skipped entirely while you're scrolled up through history, what's
-  on screen there is stale.
-- Nothing is typed while Claude is asking whether to resume a long session *from
-  a summary* ("Resume from summary (recommended)" / "Resume full session
-  as-is"). If a countdown runs out while the question is up, `claude-auto` holds 
-  and resumes the moment you've answered.
-- A limit banner with either of the things we send below it — the `continue` from
-  a countdown, or a `/low-priority` — is scrollback, not a live stop, so it's
-  never acted on twice. That's what makes a just-waited-out limit safe to leave on
-  screen, with no time window to tune.
-- A reset that's already been counted down to is ignored if the same banner
-  reappears, until enough time has passed that it must be a genuinely new limit.
-- A banner that `/usage` disproves (no bar as full as the threshold that applies
-  to it) is remembered — by its kind, its wording, and the reset time it carried
-  — and is ignored until a real limit is hit, or after 3 hours, whichever comes
-  first. A later banner resetting at a different time is a different banner, so
-  it's still checked, and a disproved checkpoint never mutes a limit banner.
-- Every row in `/usage` says "% used", so each value is only ever read from the
-  section it belongs to and the bars can't be confused for one another. The
-  *Current week (Opus)* row is deliberately not treated as a limit: Claude Code
-  falls back to Sonnet rather than stopping, so it never blocks a session.
-- A session bar at 0% prints no reset line at all — that's expected, not a failed
-  read. It just means the session isn't the limit you're waiting on.
-- Weekly resets are days out, so they print a date ("Resets Jul 22, 8am") rather
-  than a clock time. The year isn't shown; it's taken as the current one, rolling
-  into the next when the date is already well behind us. A reset that reads as
-  already past still leaves a five-minute gap before resuming, so a just-missed
-  reset — or a machine clock offset from the timezone `/usage` prints — can't
-  turn into a resume-and-retry spin.
-- Nothing is ever written to stdout or stderr. That would corrupt the TUI, so all
-  diagnostics go to the optional log file.
+
+## Platform support
+
+Linux, macOS, Windows (ConPTY). On Windows, `claude-glm-auto.cmd` runs the
+local source without installing anything.
+
 
 ## Development
 
@@ -268,24 +213,31 @@ Some more details:
 bun install
 bun run claude          # run from source via tsx
 bun run typecheck       # tsc --noEmit
-bun run build           # emit dist/claude-auto.js
+bun run build           # emit dist/claude-glm-auto.js
+bash tests/e2e.sh       # E2E suite: fake claude + mock quota API, ~60 s
 ```
 
-The run path uses [`tsx`](https://github.com/privatenumber/tsx), which transpiles
-without type-checking, so `bun run typecheck` is a separate step.
+The E2E suite runs the wrapper around `tests/fake-claude.sh` (echoes input,
+emits scripted error banners) with the quota API pointed at
+`tests/mock-quota.py` (a state file the scenarios flip mid-run), everything at
+`CGA_TIME_SCALE=0.01` so five-minute waits compress to three seconds. Seven
+scenarios: transient-at-96%-quota, certificate error, ladder escalation,
+deadline resume, early resume + bounce + disable, probe loop with the API
+down, user takeover.
 
-On Windows, `claude-auto.cmd` runs the local source without installing anything.                                 |
+### Flags & environment
 
-## Publishing
+| Flag / variable | Effect |
+|:--|:--|
+| `--no-auto-mode` | Don't pass `--permission-mode auto` |
+| `--install-alias` / `--uninstall-alias` | Manage the `claude` alias in your shell startup file |
+| `--glm-quota` | Print one quota reading and exit |
+| `--auto-debug` | Append screen snapshots and decisions to `claude-glm-auto.log` |
+| `GLM_QUOTA_URL` | Override the quota endpoint (what the E2E mock plugs into) |
+| `CGA_TIME_SCALE` | Scale every timing constant (E2E uses 0.01; default 1) |
 
-The package is published to npm as [`@hotox/claude-auto`](https://www.npmjs.com/package/@hotox/claude-auto).
 
-Releases are cut by [`.github/workflows/release.yml`](.github/workflows/release.yml)
-on every push to `main`, but **only when `version` in `package.json` changes**,
-an ordinary push is a no-op. To cut a release, bump `version` and push to `main`.
-The workflow type-checks, builds, publishes to npm, tags `v<version>`, and creates
-a GitHub Release with generated notes.
+## License
 
-It needs an npm automation token in the repo secret `NPM_TOKEN` (`gh secret set NPM_TOKEN`).
-
-</details>
+[MIT](LICENSE) © Philipp Köhler, with thanks for the original `claude-auto`.
+This fork: MIT likewise.

@@ -59,6 +59,209 @@ const apiErrorRegex: RegExp = /●\s*API Error:/i;
 // How long to sit out a 529 before sending "continue" again.
 const API_ERROR_COOLDOWN_MS: number = 5 * 60 * 1000;
 
+// ==========================================
+// GLM QUOTA API
+// ==========================================
+// GLM (bigmodel.cn) exposes the quotas that actually gate a session through an
+// authenticated GET — using the very credentials Claude Code itself runs on —
+// so the wrapper reads ground truth instead of scraping a panel. Two windows
+// come back:
+//
+//   TOKENS_LIMIT  the 5-hour rolling token window. This is the one that stops
+//                 a session outright: when it's spent, requests fail with
+//                 error 1308 and a reset time in the message.
+//   TIME_LIMIT    the monthly MCP tool-call allowance. When it's spent only
+//                 MCP calls fail; the model keeps running, so it never blocks
+//                 a session and is displayed, never waited on.
+//
+// Each carries `percentage` (0-100 spent) and `nextResetTime` (epoch ms). That
+// stamp is the authoritative resume time for a spent 5-hour window: no screen
+// parsing, no timezone arithmetic, no am/pm.
+const QUOTA_API_PATH: string = '/api/monitor/usage/quota/limit';
+
+// The monitor endpoint lives on the same host as the Anthropic-compatible API,
+// so the URL is derived from ANTHROPIC_BASE_URL's origin. GLM_QUOTA_URL
+// overrides it wholesale — that's the seam the E2E mock plugs into.
+const QUOTA_URL_OVERRIDE_ENV: string = 'GLM_QUOTA_URL';
+
+// Standing poll cadence for the title bar, and how long a request may take.
+// Five minutes matches how fast a 5-hour window visibly moves; a slow poll
+// never blocks anything (detection and resumes don't wait on it).
+const QUOTA_POLL_INTERVAL_MS: number = 5 * 60 * 1000;
+const QUOTA_FETCH_TIMEOUT_MS: number = 8000;
+
+// Consecutive failed polls back off exponentially up to this — the API is a
+// nicety, and a struggling monitor endpoint must not be hammered.
+const QUOTA_BACKOFF_MAX_MS: number = 20 * 60 * 1000;
+
+// After a failure, no *error-triggered* confirmation query before this long
+// (the standing poll is unaffected): a banner seen while the quota API is down
+// shouldn't re-query it every 2-second screen capture.
+const QUOTA_RETRY_AFTER_FAIL_MS: number = 60 * 1000;
+
+// A limit is confirmed when the 5-hour window reads at least this spent, on a
+// query that follows a limit-shaped banner. 1308 means the window is truly
+// full, but between the request failing and our query landing, tokens can age
+// out of the rolling window — 95 leaves room for that drift while still being
+// a reading the API only reports when the window is effectively spent. The
+// same number doubles as the early-resume line: a window that has fallen back
+// below it during a countdown has room again.
+const LIMIT_CONFIRM_PCT: number = 95;
+
+// Title-bar thresholds: warn on the 5-hour window from here, and mention the
+// monthly MCP allowance from here (it stays off the title otherwise — it never
+// blocks a session, so it doesn't deserve the width).
+const QUOTA_WARN_PCT: number = 85;
+const MCP_WARN_PCT: number = 90;
+
+interface GlmCredentials {
+    baseUrl: string;
+    token: string;
+}
+
+// Resolved once at startup. Exported env vars win (an explicit override), then
+// the settings.json Claude Code itself reads — $CLAUDE_CONFIG_DIR if set,
+// ~/.claude otherwise — whose `env` block carries the GLM base URL and token.
+// A half-pair from either source is not combined across sources: mixing a
+// token from one place with a base URL from another is how silent wrong-account
+// reads happen, so each source has to be complete on its own or we return null
+// and every quota feature quietly stays off. The session itself never depends
+// on them.
+function resolveGlmCredentials(): GlmCredentials | null {
+    const pair = (baseUrl: string | undefined, token: string | undefined): GlmCredentials | null =>
+        baseUrl && token ? { baseUrl, token } : null;
+
+    const fromEnv: GlmCredentials | null =
+        pair(process.env.ANTHROPIC_BASE_URL, process.env.ANTHROPIC_AUTH_TOKEN);
+    if (fromEnv !== null) return fromEnv;
+
+    const configDir: string = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
+    try {
+        const settings = JSON.parse(
+            fs.readFileSync(path.join(configDir, 'settings.json'), 'utf8'),
+        ) as { env?: Record<string, string | undefined> };
+        return pair(settings.env?.ANTHROPIC_BASE_URL, settings.env?.ANTHROPIC_AUTH_TOKEN);
+    } catch {
+        return null; // no settings.json, or not JSON — nothing to read there
+    }
+}
+
+// The monitor URL for a base URL, or null when the base URL isn't parseable.
+// origin normalises protocol/host/port and drops the /api/anthropic path.
+function quotaApiUrl(baseUrl: string): string | null {
+    try {
+        return new URL(baseUrl).origin + QUOTA_API_PATH;
+    } catch {
+        return null;
+    }
+}
+
+interface QuotaWindow {
+    percentage: number;           // percent of the window spent (0-100)
+    nextResetTime: number | null; // epoch ms; null when absent or implausible
+    currentUsage: number | null;  // TIME_LIMIT only: calls made this month
+    capacity: number | null;      // TIME_LIMIT only: calls allowed per month
+}
+
+interface QuotaSnapshot {
+    tokens: QuotaWindow | null;  // TOKENS_LIMIT — the 5-hour window
+    monthly: QuotaWindow | null; // TIME_LIMIT — monthly MCP calls (display only)
+    fetchedAt: number;           // Date.now() at parse, for staleness marks
+}
+
+// One window out of a limits[] entry, or null when the entry isn't usable.
+// percentage and nextResetTime are validated *independently*: a garbled stamp
+// must not throw away a valid percentage (the title bar still wants it), nor a
+// valid stamp a garbled percentage. A stamp outside (now-1h, now+35d) is
+// treated as absent rather than trusted: a month covers the monthly window
+// with room to spare, and an hour of clock skew still lets a *just-past* reset
+// through to the countdown clamp instead of dying here.
+function parseQuotaWindow(entry: unknown, now: number): QuotaWindow | null {
+    if (typeof entry !== 'object' || entry === null) return null;
+    const fields = entry as {
+        percentage?: unknown;
+        nextResetTime?: unknown;
+        currentValue?: unknown;
+        usage?: unknown;
+    };
+
+    const pct: number =
+        typeof fields.percentage === 'number' && Number.isFinite(fields.percentage)
+            ? fields.percentage
+            : Number.NaN;
+    if (Number.isNaN(pct)) return null;
+
+    const stamp: number =
+        typeof fields.nextResetTime === 'number' && Number.isFinite(fields.nextResetTime)
+            ? fields.nextResetTime
+            : Number.NaN;
+    const reset: number | null = !Number.isNaN(stamp)
+        && stamp > now - 60 * 60 * 1000
+        && stamp < now + 35 * 24 * 60 * 60 * 1000
+        ? stamp
+        : null;
+
+    const count = (v: unknown): number | null =>
+        typeof v === 'number' && Number.isFinite(v) ? v : null;
+
+    return {
+        percentage: pct,
+        nextResetTime: reset,
+        currentUsage: count(fields.currentValue),
+        capacity: count(fields.usage),
+    };
+}
+
+// The raw JSON body into a snapshot, or null when it isn't the shape we came
+// for. Strictness here is cheap insurance: anything doubtful becomes null, and
+// every consumer treats null as "no data" — never as "no limit".
+function parseQuotaResponse(body: unknown): QuotaSnapshot | null {
+    if (typeof body !== 'object' || body === null) return null;
+    const { code, data } = body as { code?: unknown; data?: unknown };
+    if (code !== 200 || typeof data !== 'object' || data === null) return null;
+
+    const limits: unknown = (data as { limits?: unknown }).limits;
+    if (!Array.isArray(limits)) return null;
+
+    const now: number = Date.now();
+    let tokens: QuotaWindow | null = null;
+    let monthly: QuotaWindow | null = null;
+    for (const entry of limits) {
+        const type: unknown = (entry as { type?: unknown }).type;
+        if (type === 'TOKENS_LIMIT' && tokens === null) tokens = parseQuotaWindow(entry, now);
+        if (type === 'TIME_LIMIT' && monthly === null) monthly = parseQuotaWindow(entry, now);
+    }
+    if (tokens === null && monthly === null) return null;
+    return { tokens, monthly, fetchedAt: now };
+}
+
+// Fetch and parse in one step. Authorization is the bare token — GLM's monitor
+// API wants no Bearer prefix. The token never reaches a log line: failures log
+// at most an HTTP status or the error's *name*, never its message.
+async function fetchQuotaSnapshot(creds: GlmCredentials): Promise<QuotaSnapshot | null> {
+    const url: string = process.env[QUOTA_URL_OVERRIDE_ENV] ?? quotaApiUrl(creds.baseUrl) ?? '';
+    if (url === '') {
+        log('quota API: base URL not parseable');
+        return null;
+    }
+    try {
+        const res = await fetch(url, {
+            headers: { authorization: creds.token },
+            signal: AbortSignal.timeout(QUOTA_FETCH_TIMEOUT_MS),
+        });
+        if (!res.ok) {
+            log(`quota API: HTTP ${res.status}`);
+            return null;
+        }
+        const snap = parseQuotaResponse(await res.json());
+        if (snap === null) log('quota API: response not in the expected shape');
+        return snap;
+    } catch (err) {
+        log(`quota API: ${err instanceof Error ? err.name : 'request failed'}`);
+        return null;
+    }
+}
+
 // Claude sometimes offers a "Stop and wait for limit to reset" menu; we select it
 // (press Enter) so the session parks until reset. Wait briefly so the menu has
 // fully rendered, then ignore it for a grace period so the redraw doesn't make
@@ -364,6 +567,68 @@ function warnIfProfilesBlocked(): void {
 
 if (process.argv.includes(ALIAS_INSTALL_FLAG) || process.argv.includes(ALIAS_UNINSTALL_FLAG)) {
     process.exit(runAliasCommand(process.argv.includes(ALIAS_INSTALL_FLAG)));
+}
+
+// ==========================================
+// QUOTA PROBE (--glm-quota)
+// ==========================================
+// Print one quota reading and exit, before any pty exists — so stdout is ours
+// and there's no TUI to corrupt. It's the natural test probe (credentials,
+// request and parser all exercised without a session) and a handy CLI besides.
+const QUOTA_FLAG: string = '--glm-quota';
+
+function formatDuration(ms: number): string {
+    const totalMinutes: number = Math.max(0, Math.round(ms / 60000));
+    const h: number = Math.floor(totalMinutes / 60);
+    const m: number = totalMinutes % 60;
+    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+async function printQuotaAndExit(): Promise<never> {
+    const creds: GlmCredentials | null = resolveGlmCredentials();
+    if (creds === null) {
+        process.stderr.write(
+            'claude-glm-auto: no GLM credentials found.\n' +
+            '  Export ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN, or point\n' +
+            '  CLAUDE_CONFIG_DIR at a settings.json whose env block has them.\n',
+        );
+        process.exit(1);
+    }
+
+    const snap: QuotaSnapshot | null = await fetchQuotaSnapshot(creds);
+    if (snap === null || snap.tokens === null) {
+        process.stderr.write('claude-glm-auto: quota API request failed.\n');
+        process.exit(1);
+    }
+
+    const host: string = new URL(creds.baseUrl).host;
+    const lines: string[] = [`GLM quota (${host}, fetched ${new Date().toLocaleTimeString()})`];
+
+    const tokens: QuotaWindow = snap.tokens;
+    const reset: string = tokens.nextResetTime === null
+        ? 'reset time unknown'
+        : `resets ${new Date(tokens.nextResetTime).toLocaleString()}`;
+    lines.push(`  5h token window : ${tokens.percentage}% used, ${reset}` +
+        (tokens.nextResetTime === null ? '' : ` (${formatDuration(tokens.nextResetTime - Date.now())} from now)`));
+
+    if (snap.monthly !== null) {
+        const calls: string = snap.monthly.currentUsage !== null && snap.monthly.capacity !== null
+            ? ` (${snap.monthly.currentUsage}/${snap.monthly.capacity} calls)`
+            : '';
+        const monthlyReset: string = snap.monthly.nextResetTime === null
+            ? 'reset time unknown'
+            : `resets ${new Date(snap.monthly.nextResetTime).toLocaleString()}`;
+        lines.push(`  MCP monthly     : ${snap.monthly.percentage}% used${calls}, ${monthlyReset}`);
+    }
+
+    process.stdout.write(lines.join('\n') + '\n');
+    process.exit(0);
+}
+
+// Top-level await keeps the pty (and Claude itself) from spawning underneath an
+// in-flight probe: nothing below this line runs until the probe has exited.
+if (process.argv.includes(QUOTA_FLAG)) {
+    await printQuotaAndExit();
 }
 
 // ==========================================

@@ -1,23 +1,20 @@
 {
-  "name": "@hotox/claude-auto",
-  "version": "0.7.0",
-  "description": "Auto-continue for Claude Code. Waits out your usage limit and resumes the session automatically",
-  "publishConfig": {
-    "access": "public"
-  },
-  "keywords": ["claude", "claude-code", "cli", "auto-resume", "auto-continue", "claude-auto-resume", "claude-auto-continue", "usage-limit"],
+  "name": "claude-glm-auto",
+  "version": "1.0.0",
+  "description": "Auto-continue for Claude Code on GLM (bigmodel.cn): watches the 5-hour token window via the GLM quota API, shows it in the title bar, and resumes when the limit resets",
+  "keywords": ["glm", "claude-code", "bigmodel", "zhipu", "auto-resume", "auto-continue", "quota"],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Darkblader24/claude-auto.git"
+    "url": "git+https://github.com/Radar-Lei/claude-auto.git"
   },
   "bugs": {
-    "url": "https://github.com/Darkblader24/claude-auto/issues"
+    "url": "https://github.com/Radar-Lei/claude-auto/issues"
   },
-  "homepage": "https://github.com/Darkblader24/claude-auto#readme",
+  "homepage": "https://github.com/Radar-Lei/claude-auto#readme",
   "type": "module",
   "bin": {
-    "claude-auto": "dist/claude-auto.js"
+    "claude-glm-auto": "dist/claude-glm-auto.js"
   },
   "files": [
     "dist",
@@ -39,9 +36,8 @@
     "node-pty": "^1.1.0"
   },
   "scripts": {
-    "claude": "bunx tsx claude-auto.ts",
+    "claude": "bunx tsx claude-glm-auto.ts",
     "typecheck": "tsc --noEmit",
-    "build": "tsc --project tsconfig.build.json",
-    "prepack": "tsc --project tsconfig.build.json"
+    "build": "tsc --project tsconfig.build.json"
   }
 }

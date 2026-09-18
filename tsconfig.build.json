@@ -12,6 +12,6 @@
     "allowImportingTsExtensions": false
   },
   "include": [
-    "claude-auto.ts"
+    "claude-glm-auto.ts"
   ]
 }

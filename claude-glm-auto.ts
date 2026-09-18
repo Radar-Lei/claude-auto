@@ -19,11 +19,11 @@ const WRAPPER_FLAGS: ReadonlySet<string> = new Set(['--auto-debug', AUTO_MODE_OF
 // Debug logging is opt-in via a flag (no env var). Pass --auto-debug.
 const DEBUG: boolean = process.argv.includes('--auto-debug');
 
-// Everything after `node claude-auto.ts`, minus our own flags.
+// Everything after `node claude-glm-auto.ts`, minus our own flags.
 const cliArgs: string[] = process.argv.slice(2).filter(arg => !WRAPPER_FLAGS.has(arg));
 
 // Sessions start in auto mode: we forward `--permission-mode auto` by default, so
-// claude-auto doesn't stop to ask on every tool call — the point of the wrapper is
+// claude-glm-auto doesn't stop to ask on every tool call — the point of the wrapper is
 // to keep going while you're away. Three things opt out of it:
 //   * --no-auto-mode, ours, for when you just want claude's own default;
 //   * an explicit --permission-mode, which is you naming a mode, so it wins;
@@ -303,7 +303,7 @@ const F4_SEQUENCES: string[] = ['\x1bOS', '\x1b[14~'];
 
 // How often we snapshot the rendered screen in debug mode (and run limit detection on it).
 const SCREEN_CAPTURE_INTERVAL_MS: number = 2000;
-const LOG_FILE: string = path.join(process.cwd(), 'claude-auto.log');
+const LOG_FILE: string = path.join(process.cwd(), 'claude-glm-auto.log');
 
 function log(msg: string): void {
     if (!DEBUG) return;
@@ -320,20 +320,20 @@ function log(msg: string): void {
 // A global npm install never updates itself, so a user can sit on an old build
 // indefinitely. That matters more here than for most tools: limit detection
 // keys off Claude Code's rendered wording, so when that wording changes, an
-// outdated copy stops resuming *silently* — it looks like claude-auto is broken
+// outdated copy stops resuming *silently* — it looks like claude-glm-auto is broken
 // rather than stale. So we tell them a newer version exists.
 //
 // Two constraints shape this, and neither is negotiable:
 //   1. Claude owns the terminal while it runs. Writing anything to stdout mid-
 //      session corrupts its render, so the notice is printed only from cleanup(),
 //      once the pty is gone and the screen is ours again. It goes to stderr so
-//      that `claude-auto -p '...' > out.txt` keeps a clean stdout.
+//      that `claude-glm-auto -p '...' > out.txt` keeps a clean stdout.
 //   2. A session must never wait on the network. So we never fetch-then-print:
 //      we print from a cache a *previous* run wrote, and refresh that cache in
 //      the background. First run shows nothing; every run after is instant.
-const PACKAGE_NAME: string = '@hotox/claude-auto';
+const PACKAGE_NAME: string = '@hotox/claude-glm-auto';
 const REGISTRY_URL: string = `https://registry.npmjs.org/${PACKAGE_NAME}/latest`;
-const UPDATE_CACHE_FILE: string = path.join(os.homedir(), '.claude-auto', 'update-check.json');
+const UPDATE_CACHE_FILE: string = path.join(os.homedir(), '.claude-glm-auto', 'update-check.json');
 
 // How stale the cache may get before we refresh it. The notice is a nudge, not
 // news — checking once a day is plenty and keeps us off the registry.
@@ -430,7 +430,7 @@ function printUpdateNotice(): void {
     if (!cache?.latest || !isNewer(cache.latest, VERSION)) return;
 
     process.stderr.write(
-        `\nclaude-auto ${VERSION} → ${cache.latest} — update with:\n` +
+        `\nclaude-glm-auto ${VERSION} → ${cache.latest} — update with:\n` +
         `  npm install -g ${PACKAGE_NAME}@latest\n`
     );
 }
@@ -438,7 +438,7 @@ function printUpdateNotice(): void {
 // ==========================================
 // ALIAS INSTALL
 // ==========================================
-// `alias claude=claude-auto` typed at a prompt lives and dies with that shell —
+// `alias claude=claude-glm-auto` typed at a prompt lives and dies with that shell —
 // on every platform, Linux included. No shell persists an alias for you (fish's
 // `alias --save` is the one exception), so to make it stick the line has to sit
 // in a startup file the shell re-reads on every launch. --install-alias puts it
@@ -449,8 +449,8 @@ function printUpdateNotice(): void {
 // stack up duplicates and uninstalling can't take a line the user wrote with it.
 const ALIAS_INSTALL_FLAG: string = '--install-alias';
 const ALIAS_UNINSTALL_FLAG: string = '--uninstall-alias';
-const ALIAS_BEGIN: string = '# >>> claude-auto alias >>>';
-const ALIAS_END: string = '# <<< claude-auto alias <<<';
+const ALIAS_BEGIN: string = '# >>> claude-glm-auto alias >>>';
+const ALIAS_END: string = '# <<< claude-glm-auto alias <<<';
 
 // Colour the final verdict so it can't be missed in a wall of per-file output.
 // NO_COLOR / a non-TTY stdout means the codes would just be noise, so drop them.
@@ -476,18 +476,18 @@ function posixTarget(): AliasTarget | null {
 
     if (name.includes('fish')) {
         const file: string = path.join(home, '.config', 'fish', 'config.fish');
-        return { shell: 'fish', file, line: 'alias claude claude-auto', reload: `source ${file}` };
+        return { shell: 'fish', file, line: 'alias claude claude-glm-auto', reload: `source ${file}` };
     }
     if (name.includes('zsh')) {
         // ZDOTDIR moves the whole zsh config elsewhere; when it's set, .zshrc there is the one being read.
         const file: string = path.join(process.env.ZDOTDIR || home, '.zshrc');
-        return { shell: 'zsh', file, line: "alias claude='claude-auto'", reload: `source ${file}` };
+        return { shell: 'zsh', file, line: "alias claude='claude-glm-auto'", reload: `source ${file}` };
     }
     if (name.includes('bash')) {
         // On macOS, Terminal.app opens *login* shells, which read .bash_profile and
         // never .bashrc. Everywhere else .bashrc is the interactive-shell file.
         const file: string = path.join(home, os.platform() === 'darwin' ? '.bash_profile' : '.bashrc');
-        return { shell: 'bash', file, line: "alias claude='claude-auto'", reload: `source ${file}` };
+        return { shell: 'bash', file, line: "alias claude='claude-glm-auto'", reload: `source ${file}` };
     }
     return null;
 }
@@ -509,7 +509,7 @@ function powershellTargets(): AliasTarget[] {
                 targets.push({
                     shell: exe,
                     file,
-                    line: 'Set-Alias claude claude-auto',
+                    line: 'Set-Alias claude claude-glm-auto',
                     reload: `. $PROFILE`
                 });
             }
@@ -579,15 +579,15 @@ function runAliasCommand(install: boolean): number {
 
     if (targets.length === 0) {
         out(
-            "claude-auto: couldn't work out which shell to write to.\n" +
+            "claude-glm-auto: couldn't work out which shell to write to.\n" +
             '  Add the alias to your shell\'s startup file by hand:\n' +
-            "    bash/zsh   alias claude='claude-auto'      (~/.bashrc, ~/.zshrc)\n" +
-            '    fish       alias --save claude claude-auto\n' +
-            '    PowerShell Set-Alias claude claude-auto    ($PROFILE)\n' +
+            "    bash/zsh   alias claude='claude-glm-auto'      (~/.bashrc, ~/.zshrc)\n" +
+            '    fish       alias --save claude claude-glm-auto\n' +
+            '    PowerShell Set-Alias claude claude-glm-auto    ($PROFILE)\n' +
             '  cmd.exe has no startup file: a permanent doskey macro needs the\n' +
             '  Command Processor AutoRun registry key. Use PowerShell instead.'
         );
-        out(red(`claude-auto: alias ${install ? 'install' : 'uninstall'} failed.`));
+        out(red(`claude-glm-auto: alias ${install ? 'install' : 'uninstall'} failed.`));
         return 1;
     }
 
@@ -599,13 +599,13 @@ function runAliasCommand(install: boolean): number {
         // Nothing of ours in the file: there is nothing to take out, and rewriting
         // it just to reformat what's already there would be pure vandalism.
         if (!install && !hasBlock) {
-            out(`claude-auto: nothing to do — no claude-auto alias in ${target.file}.`);
+            out(`claude-glm-auto: nothing to do — no claude-glm-auto alias in ${target.file}.`);
             continue;
         }
 
         const stripped: string = stripAliasBlock(before);
         if (hasBlock && stripped === before) {
-            out(`claude-auto: ${target.file} has an unterminated claude-auto block — fix it by hand.`);
+            out(`claude-glm-auto: ${target.file} has an unterminated claude-glm-auto block — fix it by hand.`);
             continue;
         }
 
@@ -618,21 +618,21 @@ function runAliasCommand(install: boolean): number {
             : (body ? body + eol : '');
 
         if (after === before) {
-            out(`claude-auto: nothing to do — ${target.file} is already set up.`);
+            out(`claude-glm-auto: nothing to do — ${target.file} is already set up.`);
             continue;
         }
 
         try {
             writeAliasFile(target.file, after);
         } catch (err) {
-            out(`claude-auto: couldn't write ${target.file} — ${String(err)}`);
-            out(red(`claude-auto: alias ${install ? 'install' : 'uninstall'} failed.`));
+            out(`claude-glm-auto: couldn't write ${target.file} — ${String(err)}`);
+            out(red(`claude-glm-auto: alias ${install ? 'install' : 'uninstall'} failed.`));
             return 1;
         }
         changed++;
         out(install
-            ? `claude-auto: added "${target.line}" to ${target.file} (${target.shell})`
-            : `claude-auto: removed the alias from ${target.file} (${target.shell})`);
+            ? `claude-glm-auto: added "${target.line}" to ${target.file} (${target.shell})`
+            : `claude-glm-auto: removed the alias from ${target.file} (${target.shell})`);
         out(`  Open a new shell, or run: ${target.reload}`);
     }
 
@@ -640,7 +640,7 @@ function runAliasCommand(install: boolean): number {
     // alias we just wrote would silently never appear.
     if (install && changed > 0 && os.platform() === 'win32') warnIfProfilesBlocked();
     out(green(
-        `claude-auto: alias ${install ? 'install' : 'uninstall'} successful! ` +
+        `claude-glm-auto: alias ${install ? 'install' : 'uninstall'} successful! ` +
         'Restart your terminal for it to take effect.'
     ));
     return 0;
@@ -671,18 +671,18 @@ if (process.argv.includes(ALIAS_INSTALL_FLAG) || process.argv.includes(ALIAS_UNI
 // ==========================================
 // SELF-CALL GUARD
 // ==========================================
-// A shell alias (`alias claude=claude-auto`) can't reach us: aliases are never
+// A shell alias (`alias claude=claude-glm-auto`) can't reach us: aliases are never
 // exported and we exec directly, not through a shell. But a *script* named
 // `claude` on PATH pointing back here would be found when we spawn `claude`,
 // and we'd fork-bomb. We mark the child's environment; seeing that mark on
 // startup means we're about to wrap ourselves.
-const ACTIVE_ENV: string = 'CLAUDE_AUTO_ACTIVE';
+const ACTIVE_ENV: string = 'CLAUDE_GLM_AUTO_ACTIVE';
 
 if (process.env[ACTIVE_ENV] === '1') {
     // Safe to write here: the pty doesn't exist yet, so there's no TUI to corrupt.
     process.stderr.write(
-        'claude-auto: refusing to wrap itself — "claude" on your PATH points back at claude-auto.\n' +
-        `  Alias it instead of installing it under the name "claude": claude-auto ${ALIAS_INSTALL_FLAG}\n`
+        'claude-glm-auto: refusing to wrap itself — "claude" on your PATH points back at claude-glm-auto.\n' +
+        `  Alias it instead of installing it under the name "claude": claude-glm-auto ${ALIAS_INSTALL_FLAG}\n`
     );
     process.exit(1);
 }

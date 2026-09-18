@@ -83,6 +83,26 @@ It writes the alias into your shell's startup file (`~/.zshrc`, `~/.bashrc`,
 `config.fish`, PowerShell's `$PROFILE` — it picks the right one and tells you
 which). Safe to re-run. Open a new shell afterwards.
 
+### Pinning a config directory
+
+Multiple Claude Code profiles (e.g. `~/.claude_glm`, `~/.claude_ds`) live or
+die on `CLAUDE_CONFIG_DIR`, and a plain alias would drop you on the default
+`~/.claude`. Pin the directory at install time and it is written into the
+alias line — expanded to an absolute path, so it survives any cwd:
+
+```bash
+claude-glm-auto --install-alias --auto-config-dir ~/.claude_glm
+```
+
+No flag? Then a `CLAUDE_CONFIG_DIR` already exported in the installing shell
+is frozen in; a clean environment installs the plain alias. The flag also
+works standalone, for running a one-off session on another profile — and
+extra hand-written aliases give each profile its own command:
+
+```bash
+alias claude-ds='claude-glm-auto --auto-config-dir ~/.claude_ds'
+```
+
 > Migrating from upstream `claude-auto`? Run `claude-auto --uninstall-alias`
 > first — the alias markers differ, so the old block wouldn't be removed by the
 > new one.
@@ -220,10 +240,10 @@ bash tests/e2e.sh       # E2E suite: fake claude + mock quota API, ~60 s
 The E2E suite runs the wrapper around `tests/fake-claude.sh` (echoes input,
 emits scripted error banners) with the quota API pointed at
 `tests/mock-quota.py` (a state file the scenarios flip mid-run), everything at
-`CGA_TIME_SCALE=0.01` so five-minute waits compress to three seconds. Seven
+`CGA_TIME_SCALE=0.01` so five-minute waits compress to three seconds. Eight
 scenarios: transient-at-96%-quota, certificate error, ladder escalation,
 deadline resume, early resume + bounce + disable, probe loop with the API
-down, user takeover.
+down, user takeover, alias install with a pinned config dir.
 
 ### Flags & environment
 
@@ -231,6 +251,7 @@ down, user takeover.
 |:--|:--|
 | `--no-auto-mode` | Don't pass `--permission-mode auto` |
 | `--install-alias` / `--uninstall-alias` | Manage the `claude` alias in your shell startup file |
+| `--auto-config-dir <dir>` | Run on that Claude Code config dir (`~` expanded, absolutised); with `--install-alias` it is written into the alias line |
 | `--glm-quota` | Print one quota reading and exit |
 | `--auto-debug` | Append screen snapshots and decisions to `claude-glm-auto.log` |
 | `GLM_QUOTA_URL` | Override the quota endpoint (what the E2E mock plugs into) |

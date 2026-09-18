@@ -14,13 +14,66 @@ import { createRequire } from 'node:module';
 // with an `auto-` prefix so they can't collide with claude's (`claude --debug`
 // is a real flag), and they are stripped before forwarding.
 const AUTO_MODE_OFF_FLAG: string = '--no-auto-mode';
+const CONFIG_DIR_FLAG: string = '--auto-config-dir';
 const WRAPPER_FLAGS: ReadonlySet<string> = new Set(['--auto-debug', AUTO_MODE_OFF_FLAG]);
 
 // Debug logging is opt-in via a flag (no env var). Pass --auto-debug.
 const DEBUG: boolean = process.argv.includes('--auto-debug');
 
+// --auto-config-dir <dir> (or --auto-config-dir=<dir>) pins which Claude Code
+// config directory the wrapped claude runs on — ~/.claude, ~/.claude_glm,
+// ~/.claude_ds… Claude Code picks its config dir from $CLAUDE_CONFIG_DIR alone,
+// so the flag resolves its value once and exports it, from where two consumers
+// read it: resolveGlmCredentials() (the quota features' credentials live in that
+// dir's settings.json) and the spawned claude itself (via the inherited env).
+// Returns the value plus the argv with the flag and its value removed, so the
+// rest of forwarding never sees them. A flag with no value is a usage error —
+// fail loud rather than silently run on the default config dir.
+function parseConfigDirArg(argv: string[]): { value: string | null; rest: string[] } {
+    const rest: string[] = [];
+    for (let i = 0; i < argv.length; i++) {
+        const arg = argv[i] ?? '';
+        if (arg === CONFIG_DIR_FLAG) {
+            const value = argv[i + 1];
+            if (value === undefined || value.startsWith('--')) {
+                process.stderr.write(
+                    `claude-glm-auto: ${CONFIG_DIR_FLAG} needs a directory (try ${CONFIG_DIR_FLAG} ~/.claude_glm).\n`);
+                process.exit(1);
+            }
+            return { value, rest: [...rest, ...argv.slice(i + 2)] };
+        }
+        if (arg.startsWith(`${CONFIG_DIR_FLAG}=`)) {
+            return { value: arg.slice(CONFIG_DIR_FLAG.length + 1), rest: [...rest, ...argv.slice(i + 1)] };
+        }
+        rest.push(arg);
+    }
+    return { value: null, rest };
+}
+
+// ~-expand and absolutise. Absolute because both things this value ends up in —
+// an alias line in a startup file, and a spawned claude's env — must not depend
+// on whatever cwd this happened to run in. A missing directory is refused
+// loudly: passing one is a typo waiting to confuse, and the alternative is a
+// claude that silently initialises a brand-new config there.
+function resolveConfigDir(value: string): string {
+    const expanded = value === '~' || value.startsWith('~/')
+        ? path.join(os.homedir(), value.slice(1))
+        : value;
+    const absolute = path.resolve(expanded);
+    if (!fs.existsSync(absolute)) {
+        process.stderr.write(`claude-glm-auto: config directory not found: ${absolute}\n`);
+        process.exit(1);
+    }
+    return absolute;
+}
+
+const { value: configDirArg, rest: argvRest } = parseConfigDirArg(process.argv.slice(2));
+if (configDirArg !== null) {
+    process.env.CLAUDE_CONFIG_DIR = resolveConfigDir(configDirArg);
+}
+
 // Everything after `node claude-glm-auto.ts`, minus our own flags.
-const cliArgs: string[] = process.argv.slice(2).filter(arg => !WRAPPER_FLAGS.has(arg));
+const cliArgs: string[] = argvRest.filter(arg => !WRAPPER_FLAGS.has(arg));
 
 // Sessions start in auto mode: we forward `--permission-mode auto` by default, so
 // claude-glm-auto doesn't stop to ask on every tool call — the point of the wrapper is
@@ -432,26 +485,34 @@ interface AliasTarget {
     reload: string; // how to pick it up without opening a new shell
 }
 
+// The flag clause appended to a POSIX alias line, or '' when nothing is pinned.
+// The path is double-quoted: inside bash/zsh's single-quoted alias body a double
+// quote is literal, and it keeps a path with spaces one argument for the wrapper.
+function posixConfigClause(configDir: string | null): string {
+    return configDir === null ? '' : ` ${CONFIG_DIR_FLAG} "${configDir}"`;
+}
+
 // Which file a POSIX shell actually re-reads on launch. Nothing here is a guess
 // we can make from the OS alone — it's the shell that decides, so we read $SHELL.
-function posixTarget(): AliasTarget | null {
+function posixTarget(configDir: string | null): AliasTarget | null {
     const name: string = path.basename(process.env.SHELL ?? '');
     const home: string = os.homedir();
+    const clause = posixConfigClause(configDir);
 
     if (name.includes('fish')) {
         const file: string = path.join(home, '.config', 'fish', 'config.fish');
-        return { shell: 'fish', file, line: 'alias claude claude-glm-auto', reload: `source ${file}` };
+        return { shell: 'fish', file, line: `alias claude claude-glm-auto${clause}`, reload: `source ${file}` };
     }
     if (name.includes('zsh')) {
         // ZDOTDIR moves the whole zsh config elsewhere; when it's set, .zshrc there is the one being read.
         const file: string = path.join(process.env.ZDOTDIR || home, '.zshrc');
-        return { shell: 'zsh', file, line: "alias claude='claude-glm-auto'", reload: `source ${file}` };
+        return { shell: 'zsh', file, line: `alias claude='claude-glm-auto${clause}'`, reload: `source ${file}` };
     }
     if (name.includes('bash')) {
         // On macOS, Terminal.app opens *login* shells, which read .bash_profile and
         // never .bashrc. Everywhere else .bashrc is the interactive-shell file.
         const file: string = path.join(home, os.platform() === 'darwin' ? '.bash_profile' : '.bashrc');
-        return { shell: 'bash', file, line: "alias claude='claude-glm-auto'", reload: `source ${file}` };
+        return { shell: 'bash', file, line: `alias claude='claude-glm-auto${clause}'`, reload: `source ${file}` };
     }
     return null;
 }
@@ -460,7 +521,10 @@ function posixTarget(): AliasTarget | null {
 // reliably derivable from outside — Documents can be redirected to OneDrive, and
 // pwsh and Windows PowerShell use different folders. So we ask each one that's
 // installed, and install into every profile we get back: the user may well use both.
-function powershellTargets(): AliasTarget[] {
+// A pinned config dir needs the wrapper's own flag on the command line, which
+// Set-Alias can't carry — that case becomes a function (the @args splat keeps it
+// a drop-in `claude` replacement); without one it stays a plain alias.
+function powershellTargets(configDir: string | null): AliasTarget[] {
     const targets: AliasTarget[] = [];
     for (const exe of ['pwsh', 'powershell']) {
         try {
@@ -473,7 +537,9 @@ function powershellTargets(): AliasTarget[] {
                 targets.push({
                     shell: exe,
                     file,
-                    line: 'Set-Alias claude claude-glm-auto',
+                    line: configDir === null
+                        ? 'Set-Alias claude claude-glm-auto'
+                        : `function claude { claude-glm-auto ${CONFIG_DIR_FLAG} '${configDir.replace(/'/g, "''")}' @args }`,
                     reload: `. $PROFILE`
                 });
             }
@@ -484,15 +550,28 @@ function powershellTargets(): AliasTarget[] {
     return targets;
 }
 
-function aliasTargets(): AliasTarget[] {
+// Which config directory an installed alias should pin, or null for none. The
+// flag wins; otherwise a CLAUDE_CONFIG_DIR already exported in the installing
+// shell is frozen in, so the alias keeps running the config you installed it
+// from even in shells that never export it; a clean environment installs the
+// plain alias, where claude picks its own default (~/.claude). Both sources go
+// through the same ~-expanding absolutiser, so what's frozen never depends on
+// the cwd at install time. (When the flag was passed, the CLI-args section has
+// already exported CLAUDE_CONFIG_DIR, so both sources read the same value.)
+function resolveAliasConfigDir(): string | null {
+    const value = configDirArg ?? process.env.CLAUDE_CONFIG_DIR ?? null;
+    return value === null ? null : resolveConfigDir(value);
+}
+
+function aliasTargets(configDir: string | null): AliasTarget[] {
     // The shell we were launched from decides this, not the platform: Git Bash and
     // MSYS run on Windows, set $SHELL, and read the usual POSIX startup files. So a
     // POSIX shell wins wherever we find one, and PowerShell is what "Windows, and no
     // $SHELL" means. (cmd.exe also lands here — it has no startup file at all, which
     // is why the empty-targets message below sends those users to PowerShell.)
-    const posix: AliasTarget | null = posixTarget();
+    const posix: AliasTarget | null = posixTarget(configDir);
     if (posix) return [posix];
-    return os.platform() === 'win32' ? powershellTargets() : [];
+    return os.platform() === 'win32' ? powershellTargets(configDir) : [];
 }
 
 // A startup file we didn't create is the user's file, so we leave its line
@@ -538,7 +617,9 @@ function writeAliasFile(file: string, content: string): void {
 // Both commands report to stdout: here the output *is* the point, and the pty
 // doesn't exist yet, so there's no TUI to corrupt. Returns the process exit code.
 function runAliasCommand(install: boolean): number {
-    const targets: AliasTarget[] = aliasTargets();
+    // Uninstall just drops the fenced block — what it pinned doesn't matter.
+    const configDir: string | null = install ? resolveAliasConfigDir() : null;
+    const targets: AliasTarget[] = aliasTargets(configDir);
     const out = (msg: string): void => { process.stdout.write(msg + '\n'); };
 
     if (targets.length === 0) {
@@ -548,6 +629,8 @@ function runAliasCommand(install: boolean): number {
             "    bash/zsh   alias claude='claude-glm-auto'      (~/.bashrc, ~/.zshrc)\n" +
             '    fish       alias --save claude claude-glm-auto\n' +
             '    PowerShell Set-Alias claude claude-glm-auto    ($PROFILE)\n' +
+            '  To pin a config directory (e.g. ~/.claude_glm instead of ~/.claude),\n' +
+            `  append: ${CONFIG_DIR_FLAG} "/absolute/path/to/dir"\n` +
             '  cmd.exe has no startup file: a permanent doskey macro needs the\n' +
             '  Command Processor AutoRun registry key. Use PowerShell instead.'
         );

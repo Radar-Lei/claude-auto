@@ -32,16 +32,17 @@ check_absent() {
 NOW_MS() { python3 -c 'import time;print(int(time.time()*1000))'; }
 set_state() { printf '%s' "$1" > "$STATE"; }
 
-# run_wrapper <seconds> [inject-after-s] [inject-text]
+# run_wrapper <seconds> [inject-after-s] [inject-text] [extra-wrapper-args]
 run_wrapper() {
     rm -f "$LOG" /tmp/cga-out.bin "$FIFO"; mkfifo "$FIFO"
     sleep 3600 > "$FIFO" & local holder=$!
     if [[ "${2:-}" != "" ]]; then
         ( sleep "$2"; printf '%s' "${3:-x}" > "$FIFO" 2>/dev/null || true ) &
     fi
+    # shellcheck disable=SC2086 # extra args are meant to word-split
     env PATH="$PWD/tests/bin:$PATH" CGA_TIME_SCALE=0.01 \
         GLM_QUOTA_URL="http://127.0.0.1:$PORT/api/monitor/usage/quota/limit" \
-        timeout "$1" bunx tsx claude-glm-auto.ts --auto-debug \
+        timeout "$1" bunx tsx claude-glm-auto.ts --auto-debug ${4:-} \
         < "$FIFO" > /tmp/cga-out.bin 2>/tmp/cga-err.txt || true
     kill $holder 2>/dev/null || true
     rm -f "$FIFO"
@@ -118,6 +119,34 @@ FAKE_BANNER="● API Error: Request rejected (429) · [1308][已达到 5 小时�
 FAKE_NEXT='-' run_wrapper 8 3 'x'
 check "takeover logged"             "Auto-resume cancelled (user input)" "$LOG" 1
 check_absent "no continue sent"     'Sending "continue"'              "$LOG"
+
+# --------------------------------------------------- S8 alias install config dir
+say "S8: --install-alias --auto-config-dir pins the dir; the flag never forwards"
+T=$(mktemp -d)
+mkdir -p "$T/.claude_ds"
+HOME="$T" SHELL=/bin/bash bunx tsx claude-glm-auto.ts \
+    --install-alias --auto-config-dir '~/.claude_ds' >/tmp/cga-alias.txt 2>&1
+check "alias pins expanded dir"  "[-]-auto-config-dir \"$T/.claude_ds\"" "$T/.bashrc" 1
+HOME="$T" SHELL=/bin/bash bunx tsx claude-glm-auto.ts \
+    --install-alias --auto-config-dir "$T/.claude_ds" >/dev/null 2>&1
+check "reinstall stays idempotent" "alias claude=" "$T/.bashrc" 1
+if HOME="$T" SHELL=/bin/bash bunx tsx claude-glm-auto.ts \
+    --install-alias --auto-config-dir "$T/missing" >/dev/null 2>&1; then
+    bad "missing config dir refused"
+else
+    ok "missing config dir refused"
+fi
+# An exported CLAUDE_CONFIG_DIR at install time is frozen into the block too.
+HOME="$T" SHELL=/bin/bash CLAUDE_CONFIG_DIR="$T/.claude_ds" \
+    bunx tsx claude-glm-auto.ts --install-alias >/dev/null 2>&1
+check "env dir frozen into alias" "[-]-auto-config-dir \"$T/.claude_ds\"" "$T/.bashrc" 1
+HOME="$T" SHELL=/bin/bash bunx tsx claude-glm-auto.ts --uninstall-alias >/dev/null 2>&1
+check_absent "uninstall drops the block" "claude-glm-auto" "$T/.bashrc"
+# And the flag itself is stripped before forwarding to claude.
+run_wrapper 3 '' '' "--auto-config-dir $T/.claude_ds"
+check "wrapper started"            "===== START ====="                "$LOG" 1
+check_absent "flag not forwarded"  "Forwarding to claude:.*auto-config-dir" "$LOG"
+rm -rf "$T"
 
 # ------------------------------------------------------------------ summary
 say "SUMMARY"

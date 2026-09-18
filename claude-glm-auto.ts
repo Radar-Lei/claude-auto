@@ -729,6 +729,10 @@ function trackTitle(data: string): void {
     }
     titleCarry = pendingOsc(stream.slice(consumed));
     if (titleCarry.length > TITLE_CARRY_MAX) titleCarry = '';
+    // Claude just took the title for itself; put our suffix back on top. Our
+    // own setTitle writes go to the real terminal only, never into the pty, so
+    // this can't loop.
+    if (consumed > 0) renderTitle();
 }
 
 // The part of a chunk that may be an OSC sequence still waiting for the rest of
@@ -753,12 +757,124 @@ function setTitle(title: string): void {
     } catch { /* terminal already gone */ }
 }
 
-// Put back the title Claude last set. If it never set one, that's the empty
-// title an untitled window has anyway. No-op unless the countdown took it over.
+// Put back the title Claude last set — composed with the quota suffix, so the
+// suffix survives a countdown taking the title and handing it back. If Claude
+// never set a title, the suffix (or nothing) stands alone. No-op unless the
+// countdown took the title over.
 function restoreTitle(): void {
     if (!titleOverridden) return;
     titleOverridden = false;
-    setTitle(childTitle);
+    setTitle(composeTitle());
+}
+
+// The quota leg of the title bar, e.g. "GLM 5h 82% →2h 48m": current spend of
+// the 5-hour window and how long until the window's next shift (the moment the
+// oldest tokens in it age out — during a limit wait, that *is* the resume
+// time). " ⚠" appears from QUOTA_WARN_PCT, "?" when the reading predates a
+// failed poll, " · MCP 91%" when the monthly allowance is nearly gone. Empty
+// until the first reading — Claude's title then stands alone.
+function quotaSuffix(): string {
+    const snap: QuotaSnapshot | null = lastQuota;
+    if (snap === null || snap.tokens === null) return '';
+    const tokens: QuotaWindow = snap.tokens;
+
+    let suffix: string = `GLM 5h ${Math.round(tokens.percentage)}%`;
+    if (tokens.percentage >= QUOTA_WARN_PCT) suffix += ' ⚠';
+    if (tokens.nextResetTime !== null) {
+        suffix += ` →${formatDuration(tokens.nextResetTime - Date.now())}`;
+    }
+    if (quotaStale) suffix += '?';
+    if (snap.monthly !== null && snap.monthly.percentage >= MCP_WARN_PCT) {
+        suffix += ` · MCP ${Math.round(snap.monthly.percentage)}%`;
+    }
+    return suffix;
+}
+
+// Claude's own title plus the quota suffix. Composed from the raw childTitle
+// every time — never from the last composed string — so rewrites can't stack
+// suffixes.
+function composeTitle(): string {
+    const suffix: string = quotaSuffix();
+    if (suffix === '') return childTitle;
+    return childTitle === '' ? suffix : `${childTitle} · ${suffix}`;
+}
+
+// The single writer of the title outside a countdown. While a countdown runs
+// it owns the title (titleOverridden, rewritten every second), so this stays
+// out of its way; every other change — Claude setting a title, a fresh
+// reading, a stale mark — lands through here, which is also what reasserts
+// the suffix right after one of Claude's own title writes.
+function renderTitle(): void {
+    if (titleOverridden) return;
+    setTitle(composeTitle());
+}
+
+// ==========================================
+// QUOTA POLLING
+// ==========================================
+// A standing poll keeps the title bar current and — once P4 wires it in —
+// gives a running limit wait its early-resume signal. It's fire-and-forget:
+// nothing in the wrapper ever waits on it, and it dies with the session.
+// Failed polls back off exponentially and mark the last reading stale ("?" in
+// the title) rather than dropping it — a questioned reading beats none.
+const glmCredentials: GlmCredentials | null = resolveGlmCredentials();
+
+let quotaPollTimer: NodeJS.Timeout | null = null;
+let quotaBackoffMs: number = QUOTA_POLL_INTERVAL_MS;
+let lastQuota: QuotaSnapshot | null = null;
+let quotaStale: boolean = false; // the last reading predates a failed poll
+
+function startQuotaPolling(): void {
+    if (glmCredentials === null) {
+        log('quota polling off: no GLM credentials found');
+        return;
+    }
+    void pollQuota(); // first reading immediately, the next one scheduled off it
+}
+
+function stopQuotaPolling(): void {
+    if (quotaPollTimer !== null) {
+        clearTimeout(quotaPollTimer);
+        quotaPollTimer = null;
+    }
+}
+
+// setTimeout-chained rather than setInterval: a poll that runs long or a
+// backed-off gap can never stack a second request on top of a pending one.
+function scheduleNextPoll(delayMs: number): void {
+    stopQuotaPolling();
+    quotaPollTimer = setTimeout(() => { void pollQuota(); }, delayMs);
+}
+
+async function pollQuota(): Promise<void> {
+    const snap: QuotaSnapshot | null =
+        glmCredentials === null ? null : await fetchQuotaSnapshot(glmCredentials);
+
+    if (snap === null) {
+        if (lastQuota !== null) quotaStale = true;
+        quotaBackoffMs = Math.min(quotaBackoffMs * 2, QUOTA_BACKOFF_MAX_MS);
+        log(`quota poll failed — next attempt in ${Math.round(quotaBackoffMs / 60000)} min`);
+        renderTitle();
+        scheduleNextPoll(quotaBackoffMs);
+        return;
+    }
+
+    quotaBackoffMs = QUOTA_POLL_INTERVAL_MS;
+    quotaStale = false;
+    lastQuota = snap;
+    const tokens: QuotaWindow | null = snap.tokens;
+    if (tokens !== null) {
+        const monthly: string = snap.monthly !== null ? `, MCP ${snap.monthly.percentage}%` : '';
+        log(`quota: 5h ${tokens.percentage}%${monthly}` +
+            (tokens.nextResetTime === null
+                ? ''
+                : `, resets ${new Date(tokens.nextResetTime).toLocaleTimeString()}`));
+        if (tokens.percentage >= QUOTA_WARN_PCT) {
+            log(`5-hour window at ${tokens.percentage}% — closing on the limit`);
+        }
+    }
+    renderTitle();
+    scheduleNextPoll(QUOTA_POLL_INTERVAL_MS);
 }
 
 // ==========================================
@@ -911,6 +1027,7 @@ function cleanup(): void {
         clearInterval(countdownInterval);
         countdownInterval = null;
     }
+    stopQuotaPolling();
     restoreTitle();
     try { if (process.stdin.isTTY) process.stdin.setRawMode(false); } catch { /* terminal already gone */ }
     process.stdin.pause();
@@ -958,6 +1075,7 @@ ptyProcess.onExit(({ exitCode }: { exitCode: number }) => {
 function main(): void {
     log('===== START =====');
     log(`Forwarding to claude: ${forwardedArgs.join(' ')}`);
+    startQuotaPolling();
     // Capture the screen state every x seconds
     captureInterval = setInterval(() => {
         // Already handling a limit (waiting it out or mid-verification) — do nothing.

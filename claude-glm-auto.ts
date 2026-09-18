@@ -48,72 +48,11 @@ const forwardedArgs: string[] = [...cliArgs, ...permissionModeArgs(cliArgs)];
 // CONFIG
 // ==========================================
 
-// Every phrase that means "out of quota — wait for the reset". They're aliases:
-// whichever matches, the handling is identical (same guards, same /usage
-// confirmation, same countdown), so adding a wording is a one-line change here.
-//
-// Rules for a new entry:
-//   * Anchor on the "you've hit it" wording, never on a percentage — Claude
-//     shows early warnings ("90% of your limit used") that must not trip this.
-//   * A reset clock time may be captured in groups 1–3 (hours, optional minutes,
-//     am/pm), but it's optional: the countdown always uses the time /usage
-//     reports, and the banner's own time only tells two banners apart (see
-//     DISPROVED_LIMIT_WINDOW_MS). Patterns without one work fine.
-//   * Match against the *rendered* screen, so keep whitespace lenient — a line
-//     can be re-wrapped at narrow widths — and expect no colour codes.
-const LIMIT_PATTERNS: RegExp[] = [
-    // "⎿  You've hit your monthly spend limit." — the spend cap on extra usage.
-    // No reset time in the line, so /usage supplies it: see USAGE_CONFIRM_PCT.
-    /⎿\s+ *you've\s+hit\s+your\s+monthly\s+spend\s+limit/i,
-    // "⎿  You've hit your weekly limit ∙ resets Jul 22, 8am". The reset clause
-    // is optional here, unlike the session one below: a weekly reset is days out,
-    // so it prints a date, which the clock-time groups can't match — requiring
-    // them would mean never matching this banner at all. /usage times the wait.
-    /⎿\s+ *you've\s+hit\s+your\s+weekly\s+limit(?:[\s\S]{0,80}?resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm))?/i,
-    // "⎿  You've hit your session limit ∙ resets 11:50am". Time is lenient:
-    // optional minutes, optional space, any case am/pm.
-    /⎿\s+ *you've\s+hit\s+your\s+session\s+limit[\s\S]{0,80}?resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i,
-];
-
-// Claude no longer always runs a session into its hard limit. Near the top of the
-// window it stops on its own and writes a checkpoint line instead — "● Checkpoint
-// created …" — and the same shape carries the "● Claude usage limit reached" wording.
-// Either way the session is parked until something sends "continue", so these are
-// handled exactly like a limit banner: same guards, same /usage confirmation, same
-// countdown. The one difference is the bar reading that confirms them, because a
-// checkpoint fires *before* the session is spent (see CHECKPOINT_CONFIRM_PCT).
-//
-// Rules for a new entry: it's matched against a line that starts with the assistant
-// bullet, and the phrase has to sit on that same line — so "checkpoint" written
-// anywhere in Claude's own prose can't trip this. Keep entries lowercase (matching
-// is case-insensitive) and plain: they're spliced into a regex, with the spaces
-// between words made lenient so a re-render can't break a match.
-const CHECKPOINT_PHRASES: string[] = [
-    'checkpoint',
-    'usage limit',
-];
-
-// The bullet has to open the line and the phrase has to sit on it: (?:^|\n) is
-// the line start (a /m anchor wouldn't survive lastMatch recompiling the pattern
-// with flags of its own), and every gap after it is horizontal whitespace or
-// "anything but a newline", so a match can never run across two lines.
-const CHECKPOINT_PATTERNS: RegExp[] = CHECKPOINT_PHRASES.map(phrase => new RegExp(
-    '(?:^|\n)[ \t]*●[^\n]*?' + phrase.split(/\s+/).join('[ \t]+'), 'i'));
-
-// A checkpoint is Claude stopping *near* the top of the window rather than at it,
-// so the 100% rule that confirms a limit banner would never fire for one. The
-// session bar has to read at least this much before we count down; below it the
-// line is written off as stale, exactly like a disproved banner.
-//
-// Only the session bar is judged by this threshold — the weekly bar keeps
-// USAGE_CONFIRM_PCT. A week sitting at 96% still runs sessions fine and resets
-// days out, so counting down to it on a checkpoint would park the wrapper for
-// days over a limit that isn't blocking anything.
-const CHECKPOINT_CONFIRM_PCT: number = 95;
-
-// A transient upstream failure, rendered into the transcript as "● API Error: 529"
-// (overloaded). Nothing about it is quota, so there's nothing /usage could
-// confirm — it clears on its own. All we do is wait a short while and retry.
+// Any API error, rendered into the transcript as "● API Error: …". With GLM this
+// covers both the 5-hour-window limit (error 1308, with a reset time in the
+// message) and transient failures (connection dropped mid-response, overloaded,
+// proxy/TLS trouble). Which one it is — and therefore how long to wait — is
+// decided against the GLM quota API, not the banner text alone.
 // Whitespace is loose because the line can be re-wrapped at narrow widths.
 const apiErrorRegex: RegExp = /●\s*API Error:/i;
 
@@ -143,132 +82,15 @@ const SCROLL_INDICATOR: string = ') ↓';
 // Matched against the first option's label: short enough not to wrap.
 const RESUME_PROMPT_TEXT: string = '❯ resume from summary';
 
-// A candidate limit is verified through the /usage panel instead of a chat
-// probe: we open it, read the bars for the limits that can block a session
-// (percent used + reset time), and close it again. The reset times shown there
-// are authoritative — banner times are rounded and the banner itself can be stale.
-const USAGE_COMMAND: string = '/usage';
-// Pause between typing a slash command and pressing Enter, so the autocomplete
-// has settled on it before we submit it — /usage here, /low-priority below.
-const SLASH_MENU_SETTLE_MS: number = 500;
-// Pause after Enter before the first read, so the panel has rendered.
-const USAGE_RENDER_DELAY_MS: number = 1500;
-
-// The panel is a stack of sections, each a heading followed by "███ 54% used"
-// and usually a "Resets …" line. Two of them are limits we can wait out; the
-// others are listed only as terminators, so that a percentage is never read
-// against the wrong limit:
-//
-//   Current session            the rolling session window — "Resets 11:50am"
-//   Current week (all models)  the plan's weekly quota — "Resets Jul 22, 8am"
-//   Current week (Opus)        Opus only: Claude Code drops to Sonnet rather
-//                              than stopping, so it never blocks a session
-//   What's contributing …      trailing prose, no limit of its own
-//
-// Order matters: "(all models)" is tried before the bare "current week", or the
-// Opus row would be taken for the plan quota. See findHeadings.
-type UsageSection = 'session' | 'weekly' | 'other';
-
-const USAGE_HEADINGS: { section: UsageSection; pattern: RegExp }[] = [
-    { section: 'session', pattern: /current\s+session/i },
-    { section: 'weekly', pattern: /current\s+week\s*\(\s*all\s+models\s*\)/i },
-    { section: 'other', pattern: /current\s+week/i },
-    { section: 'other', pattern: /what.s\s+contributing/i },
-];
-
-// "███ 54% used", plus the two shapes a reset line takes. The session prints a
-// clock time ("Resets 11:50am (Europe/Berlin)"); the weekly rows are days out so
-// they print a date as well ("Resets Jul 22, 8am (Europe/Berlin)"). Neither
-// regex can match the other's line — one needs a digit after "resets", the other
-// a month name — so a leaky region can't cross the two.
-const usagePercentRegex: RegExp = /(\d{1,3})\s*%\s*used/i;
-const usageResetRegex: RegExp = /resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i;
-const usageWeeklyResetRegex: RegExp = /resets\s+([a-z]{3,9})\s+(\d{1,2})\s*,?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i;
-const MONTH_ABBREVIATIONS: string[] =
-    ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
-
-// The weekly reset line carries no year. Reading one slightly in the past is
-// normal — the panel is a snapshot — but a date months behind us is next year's,
-// which happens for one week every New Year.
-const USAGE_WEEKLY_BACKDATE_MS: number = 24 * 60 * 60 * 1000;
-
-// A bar confirms its limit only when it reads 100% used; anything less means the
-// banner that triggered us was stale. The same threshold serves both bars, and
-// either one at 100% blocks the session on its own — so a banner is stale only
-// when *neither* is spent.
-//
-// Between them they cover every phrase in LIMIT_PATTERNS, including "you've hit
-// your monthly spend limit", which names neither. Extra usage is only ever spent
-// once the included plan quota is gone, so that banner can't appear while both
-// bars are still climbing: by then one of them reads 100%, and waiting for it to
-// come back is exactly what puts us back on plan quota.
-//
-// Checkpoints are the exception: they appear before the session is spent, so the
-// session bar is judged against CHECKPOINT_CONFIRM_PCT for those. The weekly bar
-// is held to this threshold either way.
-const USAGE_CONFIRM_PCT: number = 100;
-
-// When the window is too small to show the whole block at once, we scroll the
-// panel one step at a time (down arrow) and re-read, up to this many steps.
-const USAGE_SCROLL_KEY: string = '\x1b[B';
-const USAGE_SCROLL_DELAY_MS: number = 300;
-const USAGE_MAX_SCROLL_STEPS: number = 40;
-
-// Esc closes the panel; give the main screen a moment to redraw afterwards.
-const USAGE_CLOSE_KEY: string = '\x1b';
-const USAGE_CLOSE_DELAY_MS: number = 500;
-
-// A banner /usage disproved (session below 100%) is remembered — by which
-// pattern matched and the reset time it carried — and never verified again:
-// re-opening the panel for it would find the same answer. A later banner with a
-// different reset time is a different banner and still gets checked. It's
-// re-armed when a real limit is hit, or after this long, by which point the same
-// clock time belongs to a later session (and a pattern that carries no time at
-// all — where every banner looks alike — is only muted for this long).
-const DISPROVED_LIMIT_WINDOW_MS: number = 3 * 60 * 60 * 1000;
-
-// When /usage couldn't be read at all we've learned nothing about the banner, so
-// this is a plain retry backoff — long enough that the popup isn't disruptive.
-const USAGE_RETRY_COOLDOWN_MS: number = 5 * 60 * 1000;
-
-// Safety margin added on top of the /usage reset time before we resume.
+// Safety margin added on top of the quota API's nextResetTime before we resume.
 const WAIT_BUFFER_MS: number = 60 * 1000;
 
-// A reset the panel reports as already past still has to leave a gap before we
+// A reset time that is already in the past still has to leave a gap before we
 // resume, or a limit that's in fact still live would spin: resume, banner,
-// verify, resume, seconds apart. It happens when a reset has only just gone by,
-// and it happens for as long as hours if the machine's clock is offset from the
-// timezone /usage prints its times in. A session reset rolls forward a whole day
-// on its own (resumeTimeFrom); a weekly date is absolute and can't, so this is
-// the backstop for it.
+// re-check, resume, seconds apart. It happens when a reset has only just gone
+// by, and for as long as hours if the machine's clock is offset — nextResetTime
+// is an epoch-ms stamp, so this is the backstop for clock skew.
 const MIN_WAIT_MS: number = 5 * 60 * 1000;
-
-// A spent session doesn't always leave us with nothing to do but wait. Claude
-// Code can offer a way to keep going right now, on spare capacity, billed against
-// the weekly quota, and it prints that offer beneath the limit:
-//
-//   ⚠ /low-priority to continue now at lower priority · uses your weekly limit
-//
-// When that line is live we take the offer instead of counting down to a reset:
-// submitting the command carries the session straight on (Claude re-prompts
-// itself to finish the interrupted work). The offer is only ever printed beside a
-// limit that's blocking right now, which makes it its own confirmation — so this
-// path skips the /usage read entirely.
-//
-// Matched against the rendered screen, so: the warning glyph has to open the
-// line, which stops prose that merely mentions the command from tripping it; the
-// gaps are lenient, because the line re-wraps at narrow widths; and only the
-// stable opening of the sentence is required, not the "· uses your weekly limit"
-// footnote, which is the half most likely to be reworded.
-const LOW_PRIORITY_COMMAND: string = '/low-priority';
-const lowPriorityOfferRegex: RegExp =
-    /(?:^|\n)[ \t]*⚠[ \t]*\/low-priority\s+to\s+continue\s+now/i;
-
-// The command is a toggle — a second one switches low priority back *off* — so
-// sending it twice is worse than useless. Detection is held off from the moment
-// we type it until Claude's echo of it is on screen and takes that job over (see
-// LOW_PRIORITY_MARKER).
-const LOW_PRIORITY_GRACE_MS: number = 5000;
 
 // The text sent to continue a session
 const RESUME_CONTINUE_TEXT: string = 'continue';
@@ -281,17 +103,14 @@ const RESUME_CONTINUE_TEXT: string = 'continue';
 // has nothing after it and is still verified.
 //
 // The string must match how Claude renders our submitted message. If that ever
-// changes, a stale banner would be re-detected — one /usage check, then quiet for
-// DISPROVED_LIMIT_WINDOW_MS — a safe failure, but confirm it against an
-// --auto-debug screen capture (logScreen writes exactly what we match here).
+// changes, a stale banner would be re-detected — one quota check, then a wait —
+// a safe failure, but confirm it against an --auto-debug screen capture
+// (logScreen writes exactly what we match here).
 const RESUME_CONTINUE_MARKER: string = '❯ ' + RESUME_CONTINUE_TEXT;
 
-// Submitting /low-priority leaves the same kind of trace, and it means the same
-// thing: whatever sits above it is a stop we've already dealt with. So the two
-// are one test — a limit banner, checkpoint, error or /low-priority offer with
-// either marker below it is scrollback, not a live stop.
-const LOW_PRIORITY_MARKER: string = '❯ ' + LOW_PRIORITY_COMMAND;
-const HANDLED_STOP_MARKERS: readonly string[] = [RESUME_CONTINUE_MARKER, LOW_PRIORITY_MARKER];
+// A limit banner or API error with this marker below it is scrollback, not a
+// live stop.
+const HANDLED_STOP_MARKERS: readonly string[] = [RESUME_CONTINUE_MARKER];
 
 // Ctrl-U clears the input line in Claude Code; the draft can wrap, so we fire it
 // a few times to wipe the whole composer before typing our own command.
@@ -312,127 +131,6 @@ function log(msg: string): void {
     } catch {
         /* logging must never crash the wrapper */
     }
-}
-
-// ==========================================
-// UPDATE NOTICE
-// ==========================================
-// A global npm install never updates itself, so a user can sit on an old build
-// indefinitely. That matters more here than for most tools: limit detection
-// keys off Claude Code's rendered wording, so when that wording changes, an
-// outdated copy stops resuming *silently* — it looks like claude-glm-auto is broken
-// rather than stale. So we tell them a newer version exists.
-//
-// Two constraints shape this, and neither is negotiable:
-//   1. Claude owns the terminal while it runs. Writing anything to stdout mid-
-//      session corrupts its render, so the notice is printed only from cleanup(),
-//      once the pty is gone and the screen is ours again. It goes to stderr so
-//      that `claude-glm-auto -p '...' > out.txt` keeps a clean stdout.
-//   2. A session must never wait on the network. So we never fetch-then-print:
-//      we print from a cache a *previous* run wrote, and refresh that cache in
-//      the background. First run shows nothing; every run after is instant.
-const PACKAGE_NAME: string = '@hotox/claude-glm-auto';
-const REGISTRY_URL: string = `https://registry.npmjs.org/${PACKAGE_NAME}/latest`;
-const UPDATE_CACHE_FILE: string = path.join(os.homedir(), '.claude-glm-auto', 'update-check.json');
-
-// How stale the cache may get before we refresh it. The notice is a nudge, not
-// news — checking once a day is plenty and keeps us off the registry.
-const UPDATE_CHECK_INTERVAL_MS: number = 24 * 60 * 60 * 1000;
-
-// The refresh is fire-and-forget, but an abandoned socket would still hold the
-// event loop open at exit, so it gets a hard deadline.
-const UPDATE_FETCH_TIMEOUT_MS: number = 3000;
-
-// Opt-out for anyone who doesn't want the check (or is offline/air-gapped).
-const UPDATE_OPT_OUT_ENV: string = 'CLAUDE_AUTO_NO_UPDATE_CHECK';
-
-interface UpdateCache {
-    checkedAt: number;
-    latest: string;
-}
-
-const requireFrom = createRequire(import.meta.url);
-
-// package.json sits next to the source in dev but one level up from dist/ once
-// installed. Rather than guess the layout, try both and take whichever is
-// actually ours — checking the name means a stray package.json can't fool us.
-function readOwnVersion(): string {
-    for (const rel of ['./package.json', '../package.json']) {
-        try {
-            const pkg = requireFrom(rel) as { name?: string; version?: string };
-            if (pkg.name === PACKAGE_NAME && pkg.version) return pkg.version;
-        } catch {
-            /* not there — try the next candidate */
-        }
-    }
-    return '0.0.0'; // unknown version: compares older than everything, so we stay quiet
-}
-
-const VERSION: string = readOwnVersion();
-
-// True when `latest` is strictly ahead of `current`. Compares major/minor/patch
-// numerically and ignores any prerelease suffix: we only ever read the `latest`
-// dist-tag, so a prerelease can't show up here unless someone tags one as latest.
-function isNewer(latest: string, current: string): boolean {
-    const parts = (v: string): number[] =>
-        v.split('-')[0]!.split('.').map(n => parseInt(n, 10) || 0);
-    const [a, b] = [parts(latest), parts(current)];
-    for (let i = 0; i < 3; i++) {
-        const [x, y] = [a[i] ?? 0, b[i] ?? 0];
-        if (x !== y) return x > y;
-    }
-    return false;
-}
-
-function readUpdateCache(): UpdateCache | null {
-    try {
-        return JSON.parse(fs.readFileSync(UPDATE_CACHE_FILE, 'utf8')) as UpdateCache;
-    } catch {
-        return null; // absent or corrupt — treated the same: nothing to say yet
-    }
-}
-
-// Refresh the cache for the *next* run. Deliberately not awaited: nothing in
-// this process depends on the result, and unref'ing the timeout means a slow
-// registry can never hold the exit open.
-function refreshUpdateCache(): void {
-    const cache = readUpdateCache();
-    if (cache && Date.now() - cache.checkedAt < UPDATE_CHECK_INTERVAL_MS) return;
-
-    void (async (): Promise<void> => {
-        try {
-            const res = await fetch(REGISTRY_URL, {
-                signal: AbortSignal.timeout(UPDATE_FETCH_TIMEOUT_MS),
-                headers: { accept: 'application/vnd.npm.install-v1+json' }
-            });
-            if (!res.ok) return;
-            const { version } = await res.json() as { version?: string };
-            if (!version) return;
-
-            const next: UpdateCache = { checkedAt: Date.now(), latest: version };
-            fs.mkdirSync(path.dirname(UPDATE_CACHE_FILE), { recursive: true });
-            fs.writeFileSync(UPDATE_CACHE_FILE, JSON.stringify(next));
-            log(`update check: latest=${version} current=${VERSION}`);
-        } catch {
-            /* offline, rate-limited, registry down — a nudge isn't worth a warning */
-        }
-    })();
-}
-
-// Called from cleanup(), i.e. only once the pty is dead. Reads the cache the
-// previous run left behind; never touches the network.
-function printUpdateNotice(): void {
-    if (process.env[UPDATE_OPT_OUT_ENV] === '1') return;
-    // Not a terminal? Then stderr is a log or a pipe, and this is just noise.
-    if (!process.stderr.isTTY) return;
-
-    const cache = readUpdateCache();
-    if (!cache?.latest || !isNewer(cache.latest, VERSION)) return;
-
-    process.stderr.write(
-        `\nclaude-glm-auto ${VERSION} → ${cache.latest} — update with:\n` +
-        `  npm install -g ${PACKAGE_NAME}@latest\n`
-    );
 }
 
 // ==========================================
@@ -711,9 +409,6 @@ const ptyProcess = pty.spawn(shell, args, {
     useConptyDll: true
 });
 
-// Claude is already starting; this rides along in the background and only
-// affects what the *next* run prints.
-refreshUpdateCache();
 
 // @xterm/headless ships a CJS bundle whose named exports Node's ESM loader can't
 // statically detect, so we pull Terminal in via require() (this project runs
@@ -730,13 +425,9 @@ const term = new Terminal({ cols, rows, allowProposedApi: true });
 // DETECTION STATE
 // ==========================================
 let isWaiting: boolean = false;     // a confirmed limit countdown is running
-let isVerifying: boolean = false;   // /usage panel is open for verification
+let isVerifying: boolean = false;   // a quota API query is in flight
 let isHandlingMenu: boolean = false; // selecting the wait-for-reset menu
-let isHandlingLowPriority: boolean = false; // /low-priority submitted, waiting for its echo
 let countdownInterval: NodeJS.Timeout | null = null;
-let disprovedBannerKey: string | null = null; // identity of the banner /usage said wasn't a limit
-let disprovedAt: number = 0;                  // wall-clock time /usage disproved it
-let usageRetryUntil: number = 0;              // no /usage re-read before this (read failed)
 let captureInterval: NodeJS.Timeout | null = null;
 let currentScreen: string = '';
 
@@ -964,7 +655,6 @@ function cleanup(): void {
     // prompt returns to a clean screen instead of mid-dialog.
     const resetSeq: string = onboardingSeen ? TERMINAL_RESET + ONBOARDING_CLEAR : TERMINAL_RESET;
     try { process.stdout.write(resetSeq); } catch { /* terminal already gone */ }
-    printUpdateNotice();
 }
 
 // process.exit() drops anything still queued on stdout, and on Windows a TTY
@@ -1006,7 +696,7 @@ function main(): void {
     // Capture the screen state every x seconds
     captureInterval = setInterval(() => {
         // Already handling a limit (waiting it out or mid-verification) — do nothing.
-        if (isWaiting || isVerifying || isHandlingMenu || isHandlingLowPriority) return;
+        if (isWaiting || isVerifying || isHandlingMenu) return;
         currentScreen = captureScreen();
         onScreenCapture();
     }, SCREEN_CAPTURE_INTERVAL_MS);
@@ -1028,19 +718,6 @@ function logScreen(screen: string = currentScreen, msg: string = "SCREEN"): void
 // ==========================================
 // LIMIT DETECTION
 // ==========================================
-// Parse a reset clock time match into minutes-of-day (0–1439), or null when the
-// pattern didn't capture one. Both the banner patterns and the /usage regex put
-// (hours)(:minutes)(am/pm) in groups 1–3 — but a limit phrase need not carry a
-// time at all (see LIMIT_PATTERNS), in which case there's nothing to parse.
-function resetMinutes(match: RegExpMatchArray): number | null {
-    if (match[1] === undefined || match[3] === undefined) return null;
-    let hours: number = parseInt(match[1], 10);
-    const minutes: number = match[2] ? parseInt(match[2], 10) : 0;
-    const ampm: string = match[3].toLowerCase();
-    if (ampm === 'pm' && hours < 12) hours += 12;
-    if (ampm === 'am' && hours === 12) hours = 0;
-    return hours * 60 + minutes;
-}
 
 // The newest match of `pattern` on screen and where it starts, or null if
 // there's none. We take the last one because a premature reset can leave the old
@@ -1054,68 +731,27 @@ function lastMatch(screen: string, pattern: RegExp): { index: number; match: Reg
     return last === null ? null : { index: last.index, match: last };
 }
 
-interface LimitBanner {
-    index: number;   // where it starts on screen, for the staleness test
-    text: string;    // what matched, for the log
-    key: string;     // identity for the disproof memo
-}
-
-// The newest banner of one kind on screen, whichever phrasing it used: every
-// pattern is searched and the one furthest down wins, because that's the one
-// that says whether we're still stopped.
-//
-// `key` is what a disproof is remembered under, so it has to name the *limit*,
-// not the pixels: the kind, the pattern that matched, and the reset time it
-// carried. Two renders of one banner (re-wrapped, or with a live "try again in
-// 34m" inside the match) share a key; a later limit resetting at a different time
-// doesn't, so it's verified afresh. A phrase carrying no time has one key for all
-// its banners — every one after a disproof stays muted for
-// DISPROVED_LIMIT_WINDOW_MS. The kind is in the key so that a disproved
-// checkpoint can't mute a limit banner, or the other way round.
-function newestBanner(screen: string, patterns: RegExp[], kind: string): LimitBanner | null {
-    let newest: LimitBanner | null = null;
-    for (const [patternIndex, pattern] of patterns.entries()) {
-        const found = lastMatch(screen, pattern);
-        if (found === null) continue;
-        if (newest !== null && found.index <= newest.index) continue;
-        const minutes: number | null = resetMinutes(found.match);
-        newest = {
-            index: found.index,
-            text: found.match[0],
-            key: `${kind}#${patternIndex}@${minutes ?? 'no-reset-time'}`,
-        };
-    }
-    return newest;
-}
 
 // True when something we sent to get a stopped session moving again — the
-// "continue" from a countdown, or a /low-priority — sits below `index`, i.e. we
-// have already dealt with whatever we matched there, so it's stale scrollback.
-// See HANDLED_STOP_MARKERS: a genuinely live banner, offer or error renders below
-// the last of them, so nothing follows it and it still gets handled.
+// "continue" from a resume — sits below `index`, i.e. we have already dealt
+// with whatever we matched there, so it's stale scrollback.
+// See HANDLED_STOP_MARKERS: a genuinely live error renders below the last of
+// them, so nothing follows it and it still gets handled.
 function alreadyHandledPast(screen: string, index: number): boolean {
     const below: string = screen.slice(index);
     return HANDLED_STOP_MARKERS.some(marker => below.includes(marker));
 }
 
-// A /low-priority offer that's still live: on screen, and with nothing we've
-// already sent below it. Both halves matter — the offer printed beside a limit we
-// have *already* taken it for stays on screen, and acting on it a second time
-// would toggle the session back to normal priority.
-function hasLiveLowPriorityOffer(screen: string): boolean {
-    const offer = lastMatch(screen, lowPriorityOfferRegex);
-    return offer !== null && !alreadyHandledPast(screen, offer.index);
-}
 
 // True while Claude's resume-from-summary question is on screen. Answering it is
-// the user's call, so we send nothing — not /usage, not the resume.
+// the user's call, so we send nothing — no quota query, no resume.
 function hasResumePrompt(screen: string): boolean {
     return screen.toLowerCase().includes(RESUME_PROMPT_TEXT);
 }
 
 function detectLimit(screen: string): void {
     // Already handling a limit (waiting it out or mid-verification) — do nothing.
-    if (isWaiting || isVerifying || isHandlingMenu || isHandlingLowPriority) return;
+    if (isWaiting || isVerifying || isHandlingMenu) return;
 
     // Scrolled-up history is stale; ignore it.
     if (screen.includes(SCROLL_INDICATOR)) return;
@@ -1127,8 +763,8 @@ function detectLimit(screen: string): void {
     }
 
     // Auto-select Claude's "Stop and wait for limit to reset" menu when shown.
-    // While the menu is on screen we never run limit detection (it would type
-    // "/usage" into the menu), so handle it here and bail out.
+    // While the menu is on screen we never run error detection (it would type
+    // into the menu), so handle it here and bail out.
     if (screen.toLowerCase().includes(MENU_PROMPT_TEXT)) {
         isHandlingMenu = true;
         log('Menu detected — selecting "Stop and wait for limit to reset"');
@@ -1141,108 +777,9 @@ function detectLimit(screen: string): void {
         return;
     }
 
-    // A session limit outranks a 529: if we're out of quota, retrying in five
-    // minutes would just hit the limit again. A checkpoint outranks it for the
-    // same reason — "● Claude usage limit reached" is quota, not an overload —
-    // but it comes second, since an outright limit banner is the better evidence
-    // when both are on screen.
-    if (handleLimitBanner(screen)) return;
-    if (handleCheckpointBanner(screen)) return;
+    // The only stop signal left: an API error line. Whether it's quota (GLM's
+    // 5-hour window) or something transient is decided inside.
     handleApiError(screen);
-}
-
-// A limit banner and a checkpoint are the same situation — the session has
-// stopped and won't restart on its own — so both run through one handler, and
-// with it one set of safeguards: the staleness test, the /low-priority shortcut,
-// the disproof memo, the /usage backoff, and the /usage confirmation itself. The
-// only thing that differs is how full the session bar has to read before the
-// stop counts as real (see CHECKPOINT_CONFIRM_PCT).
-//
-// Returns true when a live banner was found and verification started, so the
-// caller knows the screen is spoken for.
-function handleStopBanner(
-    screen: string,
-    banner: LimitBanner | null,
-    label: string,
-    sessionConfirmPct: number,
-): boolean {
-    if (banner === null) return false;
-
-    // If something we sent to get the session going again — a resumed "continue",
-    // a /low-priority — sits below the banner, we've already dealt with it and this
-    // is stale scrollback, so ignore it. A genuinely still-live stop renders below
-    // the last of those, so it has nothing after it and falls through.
-    if (alreadyHandledPast(screen, banner.index)) {
-        log(`${label} sits above a resume we already sent — ignoring as stale`);
-        return false;
-    }
-
-    // Claude is offering to continue right now at lower priority. That beats
-    // every path below: there's no reset to wait for, and no /usage read to do —
-    // the offer only shows up beside a limit that's blocking right now, so it
-    // confirms the banner by being there. Checked before the disproof memo and
-    // the /usage backoff, both of which exist only to keep us from re-opening
-    // the panel, which this doesn't do.
-    if (hasLiveLowPriorityOffer(screen)) {
-        log(`${label} with a live /low-priority offer — continuing at lower priority`);
-        sendLowPriority();
-        return true;
-    }
-
-    // This exact banner was already checked against /usage and disproved. Opening
-    // the panel again would only find the same answer, so leave it alone until a
-    // real limit re-arms detection or the window expires.
-    if (disprovedBannerKey !== null &&
-        banner.key === disprovedBannerKey &&
-        Date.now() - disprovedAt < DISPROVED_LIMIT_WINDOW_MS) {
-        log(`Same ${label.toLowerCase()} /usage already disproved — ignoring`);
-        return false;
-    }
-
-    // A previous /usage read failed; back off before opening the panel again.
-    if (Date.now() < usageRetryUntil) {
-        log(`${label} on screen but inside /usage retry backoff — ignoring`);
-        return false;
-    }
-
-    // Candidate stop on the live screen. Confirm it against /usage: the banner is
-    // only trusted when the Current session bar actually reads full enough.
-    log(`Possible ${label.toLowerCase()} ("${banner.text.replace(/\s+/g, ' ').trim()}")` +
-        ` — opening /usage to verify against ${sessionConfirmPct}%`);
-    isVerifying = true;
-    verifyViaUsage(banner.key, sessionConfirmPct)
-        .catch(err => log(`/usage verification error: ${err}`))
-        .finally(() => { isVerifying = false; });
-    return true;
-}
-
-// "You've hit your …" — Claude saying the quota is gone. Only a bar at
-// USAGE_CONFIRM_PCT confirms it.
-function handleLimitBanner(screen: string): boolean {
-    return handleStopBanner(
-        screen, newestBanner(screen, LIMIT_PATTERNS, 'limit'), 'Limit banner', USAGE_CONFIRM_PCT);
-}
-
-// "● Checkpoint …" — Claude stopping itself just short of the limit. Same
-// handling, lower bar: at 100% it would never fire, since the whole point of a
-// checkpoint is that it lands before the session is spent.
-function handleCheckpointBanner(screen: string): boolean {
-    return handleStopBanner(
-        screen, newestBanner(screen, CHECKPOINT_PATTERNS, 'checkpoint'), 'Checkpoint', CHECKPOINT_CONFIRM_PCT);
-}
-
-// Submit /low-priority, in the same two steps as /usage: type it, let the
-// autocomplete settle on it, then Enter. Detection stays out of the way until
-// Claude's echo of the command is on screen, from where LOW_PRIORITY_MARKER keeps
-// the limit above it from being re-detected — and keeps the offer beside it from
-// being taken a second time, which would switch low priority back off.
-function sendLowPriority(): void {
-    isHandlingLowPriority = true;
-    ptyProcess.write(CLEAR_INPUT_SEQUENCE + LOW_PRIORITY_COMMAND);
-    setTimeout(() => {
-        ptyProcess.write('\r');
-        setTimeout(() => { isHandlingLowPriority = false; }, LOW_PRIORITY_GRACE_MS);
-    }, SLASH_MENU_SETTLE_MS);
 }
 
 // A 529 is transient, so there is no panel to confirm it against — the screen is
@@ -1262,257 +799,9 @@ function handleApiError(screen: string): void {
     startCountdown(Date.now() + API_ERROR_COOLDOWN_MS);
 }
 
-// ==========================================
-// /usage VERIFICATION
-// ==========================================
-interface UsageReading {
-    sessionPercentUsed: number;
-    sessionResetMinutesOfDay: number | null; // the panel omits it while the bar reads 0%
-    weeklyPercentUsed: number | null;        // null when the panel shows no weekly row
-    weeklyResetAtMs: number | null;
-}
-
-// Read the panel and decide. `sessionConfirmPct` is how full the session bar has
-// to read for the banner that sent us here to count as real: USAGE_CONFIRM_PCT
-// for a limit banner, the lower CHECKPOINT_CONFIRM_PCT for a checkpoint. The
-// weekly bar is always held to USAGE_CONFIRM_PCT — see CHECKPOINT_CONFIRM_PCT.
-async function verifyViaUsage(bannerKey: string, sessionConfirmPct: number): Promise<void> {
-    const usage = await readUsagePanel();
-    if (usage === null) {
-        usageRetryUntil = Date.now() + USAGE_RETRY_COOLDOWN_MS;
-        log('Could not read the Current session block from /usage — will retry after backoff');
-        return;
-    }
-    log(`/usage read: session ${usage.sessionPercentUsed}% used` +
-        `, resets at minutes-of-day ${usage.sessionResetMinutesOfDay ?? 'n/a'}` +
-        `; week ${usage.weeklyPercentUsed ?? 'n/a'}% used` +
-        `, resets ${usage.weeklyResetAtMs === null ? 'n/a' : new Date(usage.weeklyResetAtMs).toLocaleString()}`);
-
-    // The limits that are actually spent, each with the moment it comes back.
-    // Either bar stops the session on its own, so both are collected: we
-    // wait for the last of them, since resuming while the other is still spent
-    // would only walk into the banner again.
-    const exhausted: { name: string; resumeAt: number | null }[] = [];
-    if (usage.sessionPercentUsed >= sessionConfirmPct) {
-        exhausted.push({
-            name: 'session',
-            resumeAt: usage.sessionResetMinutesOfDay === null
-                ? null
-                : resumeTimeFrom(usage.sessionResetMinutesOfDay),
-        });
-    }
-    if (usage.weeklyPercentUsed !== null && usage.weeklyPercentUsed >= USAGE_CONFIRM_PCT) {
-        // Already an absolute date, so unlike the session it needs no rolling
-        // forward — only the same safety margin.
-        exhausted.push({
-            name: 'week',
-            resumeAt: usage.weeklyResetAtMs === null ? null : usage.weeklyResetAtMs + WAIT_BUFFER_MS,
-        });
-    }
-
-    if (exhausted.length === 0) {
-        disprovedBannerKey = bannerKey;
-        disprovedAt = Date.now();
-        log(`Session below ${sessionConfirmPct}% and week below ${USAGE_CONFIRM_PCT}%` +
-            ` — banner ${bannerKey} is stale, ignoring it from now on`);
-        return;
-    }
-
-    // A spent limit whose reset line didn't parse can't be counted down to, and
-    // it isn't a disproof either — the limit is real. Fall back to any other
-    // spent limit, and if there's none, treat the read as failed and retry.
-    const resumeTimes: number[] = [];
-    for (const limit of exhausted) {
-        if (limit.resumeAt === null) log(`The ${limit.name} limit is spent but its reset line didn't parse`);
-        else resumeTimes.push(limit.resumeAt);
-    }
-    if (resumeTimes.length === 0) {
-        usageRetryUntil = Date.now() + USAGE_RETRY_COOLDOWN_MS;
-        log('Limit confirmed but no reset time to count down to — will retry after backoff');
-        return;
-    }
-
-    // A real limit ends any prior disproof: whatever banner we'd written off
-    // belongs to a session that's over, so the next one gets verified again.
-    disprovedBannerKey = null;
-    disprovedAt = 0;
-    usageRetryUntil = 0;
-
-    log(`Confirmed by /usage: ${exhausted.map(l => l.name).join(' + ')} spent`);
-    const resumeAt: number = Math.max(...resumeTimes);
-    startCountdown(resumeAt < Date.now() ? Date.now() + MIN_WAIT_MS : resumeAt);
-}
-
-// The absolute time to resume at, from a reset clock time in minutes-of-day:
-// today's occurrence plus the safety margin, or tomorrow's if that's already past.
-function resumeTimeFrom(targetMinutesOfDay: number): number {
-    const hours = Math.floor(targetMinutesOfDay / 60);
-    const minutes = targetMinutesOfDay % 60;
-
-    const now = new Date();
-    let targetTimeMs = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hours, minutes, 0, 0).getTime();
-    targetTimeMs += WAIT_BUFFER_MS;
-    if (targetTimeMs < Date.now()) {
-        targetTimeMs += 24 * 60 * 60 * 1000;
-    }
-    return targetTimeMs;
-}
-
-// Every heading on screen, in the order they appear. A heading overlapping one
-// already found is dropped, which is what keeps "Current week (all models)" from
-// being taken for the bare "current week" terminator as well: USAGE_HEADINGS
-// lists the specific pattern first, so the specific one claims the spot.
-function findHeadings(screen: string): { index: number; end: number; section: UsageSection }[] {
-    const found: { index: number; end: number; section: UsageSection }[] = [];
-    for (const { section, pattern } of USAGE_HEADINGS) {
-        const re: RegExp = new RegExp(pattern.source, 'gi');
-        let m: RegExpExecArray | null;
-        while ((m = re.exec(screen)) !== null) {
-            const [index, end] = [m.index, m.index + m[0].length];
-            if (found.some(h => index < h.end && h.index < end)) continue;
-            found.push({ index, end, section });
-        }
-    }
-    return found.sort((a, b) => a.index - b.index);
-}
-
-// The visible panel cut into its sections. `carried` is the section the previous
-// screen ended in: the panel scrolls a line at a time, so a block's tail often
-// arrives with its own heading already off the top, and that text still belongs
-// to it. With nothing carried, text above the first heading (the cost summary at
-// the top of the panel) belongs to no limit and is dropped.
-function splitIntoSections(screen: string, carried: UsageSection | null): { section: UsageSection; text: string }[] {
-    const headings = findHeadings(screen);
-    const regions: { section: UsageSection; text: string }[] = [];
-    const firstIdx: number = headings[0]?.index ?? screen.length;
-    if (carried !== null && firstIdx > 0) regions.push({ section: carried, text: screen.slice(0, firstIdx) });
-    for (const [i, heading] of headings.entries()) {
-        regions.push({ section: heading.section, text: screen.slice(heading.index, headings[i + 1]?.index ?? screen.length) });
-    }
-    return regions;
-}
-
-// Absolute time for a weekly reset line ("Resets Jul 22, 8am"), or null if the
-// month name isn't one. Groups: month, day, hours, optional minutes, am/pm. The
-// panel prints no year, so we take the current one and step forward when that
-// lands well in the past — a weekly reset is always ahead of us, so a January
-// date read in late December belongs to next year.
-function weeklyResetTime(match: RegExpMatchArray): number | null {
-    const month: number = MONTH_ABBREVIATIONS.indexOf(match[1]!.slice(0, 3).toLowerCase());
-    if (month === -1) return null;
-    const day: number = parseInt(match[2]!, 10);
-    let hours: number = parseInt(match[3]!, 10);
-    const minutes: number = match[4] ? parseInt(match[4], 10) : 0;
-    const ampm: string = match[5]!.toLowerCase();
-    if (ampm === 'pm' && hours < 12) hours += 12;
-    if (ampm === 'am' && hours === 12) hours = 0;
-
-    const now = new Date();
-    const at = (year: number): number => new Date(year, month, day, hours, minutes, 0, 0).getTime();
-    const thisYear: number = at(now.getFullYear());
-    return thisYear < Date.now() - USAGE_WEEKLY_BACKDATE_MS ? at(now.getFullYear() + 1) : thisYear;
-}
-
-// Open the /usage panel and read the bars that can block a session: the current
-// one and the plan's weekly quota. When the window is too small to show them at
-// once, scroll the panel one step at a time and keep reading until everything
-// the decision needs has been seen. Always closes the panel (Esc) before
-// returning; null means even the session bar couldn't be read.
-async function readUsagePanel(): Promise<UsageReading | null> {
-    ptyProcess.write(CLEAR_INPUT_SEQUENCE + USAGE_COMMAND);
-    await sleep(SLASH_MENU_SETTLE_MS);
-    ptyProcess.write('\r');
-    await sleep(USAGE_RENDER_DELAY_MS);
-
-    let sessionPercent: number | null = null;
-    let sessionReset: number | null = null;
-    let weeklyPercent: number | null = null;
-    let weeklyResetAtMs: number | null = null;
-    let openSection: UsageSection | null = null; // section the next screen opens in
-    let previousScreen: string | null = null;
-
-    for (let step = 0; step <= USAGE_MAX_SCROLL_STEPS; step++) {
-        const screen = captureScreen();
-        logScreen(screen, `/usage screen (scroll step ${step})`);
-
-        // A scroll that changed nothing means we're at the bottom of the panel;
-        // whatever we haven't found by now isn't there.
-        if (screen === previousScreen) {
-            log('/usage screen unchanged after scroll — reached the bottom');
-            break;
-        }
-        previousScreen = screen;
-
-        // Values are only ever taken from the section they belong to, so the
-        // weekly rows — which also say "% used" — can't be read as the session
-        // bar, or the other way round.
-        for (const region of splitIntoSections(screen, openSection)) {
-            openSection = region.section;
-            if (region.section === 'session') {
-                if (sessionPercent === null) {
-                    const m = region.text.match(usagePercentRegex);
-                    if (m) sessionPercent = parseInt(m[1]!, 10);
-                }
-                if (sessionReset === null) {
-                    const m = region.text.match(usageResetRegex);
-                    if (m) sessionReset = resetMinutes(m);
-                }
-            } else if (region.section === 'weekly') {
-                if (weeklyPercent === null) {
-                    const m = region.text.match(usagePercentRegex);
-                    if (m) weeklyPercent = parseInt(m[1]!, 10);
-                }
-                if (weeklyResetAtMs === null) {
-                    const m = region.text.match(usageWeeklyResetRegex);
-                    if (m) weeklyResetAtMs = weeklyResetTime(m);
-                }
-            }
-        }
-
-        // A bar below 100% is one we'll never wait on, so its reset time isn't
-        // needed — which is just as well, since the session prints none at all
-        // while it reads 0%. On a plan with no weekly row nothing completes the
-        // weekly half and we simply scroll to the bottom, which is where the
-        // unchanged-screen check above stops us.
-        const sessionRead: boolean = sessionPercent !== null &&
-            (sessionPercent < USAGE_CONFIRM_PCT || sessionReset !== null);
-        const weeklyRead: boolean = weeklyPercent !== null &&
-            (weeklyPercent < USAGE_CONFIRM_PCT || weeklyResetAtMs !== null);
-        if (sessionRead && weeklyRead) break;
-
-        if (step < USAGE_MAX_SCROLL_STEPS) {
-            ptyProcess.write(USAGE_SCROLL_KEY);
-            await sleep(USAGE_SCROLL_DELAY_MS);
-        }
-    }
-
-    // log("Closing the window")
-    // ptyProcess.write(USAGE_CLOSE_KEY);
-    // ptyProcess.write(USAGE_CLOSE_KEY);
-    // await sleep(USAGE_CLOSE_DELAY_MS);
-    // ptyProcess.write(' \x08');
-    // await sleep(200);
-    // log("Window closed")
-
-    log("Closing the window")
-    ptyProcess.write(USAGE_CLOSE_KEY);
-    await sleep(100);
-    ptyProcess.write('\x1b[<35;1;1M');
-    await sleep(USAGE_CLOSE_DELAY_MS);
-    log("Window closed")
-
-    if (sessionPercent === null) return null;
-    return {
-        sessionPercentUsed: sessionPercent,
-        sessionResetMinutesOfDay: sessionReset,
-        weeklyPercentUsed: weeklyPercent,
-        weeklyResetAtMs,
-    };
-}
-
 // Wait until `targetTimeMs`, then send "continue". The target is either the
-// authoritative reset time /usage gave us, or a short cooldown after a 529. From
-// here until we resume, detection is paused (isWaiting), so nothing re-enters.
+// quota API's nextResetTime (plus buffer) or a short cooldown for a transient
+// error. From here until we resume, detection is paused (isWaiting).
 function startCountdown(targetTimeMs: number): void {
     isWaiting = true;
 
@@ -1566,9 +855,6 @@ function cancelCountdown(): void {
     }
     restoreTitle();
     isWaiting = false;
-    disprovedBannerKey = null;
-    disprovedAt = 0;
-    usageRetryUntil = 0;
     log('Countdown cancelled (F4) — detection re-armed');
 }
 

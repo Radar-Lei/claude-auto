@@ -1,0 +1,14 @@
+{
+  "accounts": [
+    {
+      "id": "main",
+      "name": "主账号",
+      "apiKey": "填写主账号的官方 GLM API Key"
+    },
+    {
+      "id": "backup",
+      "name": "备用账号",
+      "apiKey": "填写备用账号的官方 GLM API Key"
+    }
+  ]
+}

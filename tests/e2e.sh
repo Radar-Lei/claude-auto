@@ -10,10 +10,19 @@
 set -u
 cd "$(dirname "$0")/.."
 
+REPO="$PWD"
 PORT=18931
-STATE=/tmp/cga-mock-state.json
-FIFO=/tmp/cga-stdin.fifo
-LOG=claude-glm-auto.log
+T=$(mktemp -d)
+STATE="$T/state.json"
+FIFO="$T/stdin.fifo"
+LOG="$T/claude-glm-auto.log"
+PROFILE="$T/profile"
+mkdir -p "$PROFILE"
+export CLAUDE_CONFIG_DIR="$PROFILE"
+export ANTHROPIC_BASE_URL=https://open.bigmodel.cn/api/anthropic
+export ANTHROPIC_AUTH_TOKEN=test-direct
+unset GLM_QUOTA_URL
+
 PASS=0; FAIL=0
 
 say()  { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
@@ -34,22 +43,26 @@ set_state() { printf '%s' "$1" > "$STATE"; }
 
 # run_wrapper <seconds> [inject-after-s] [inject-text] [extra-wrapper-args]
 run_wrapper() {
-    rm -f "$LOG" /tmp/cga-out.bin "$FIFO"; mkfifo "$FIFO"
+    rm -f "$LOG" "$T/out.bin" "$FIFO"; mkfifo "$FIFO"
     sleep 3600 > "$FIFO" & local holder=$!
     if [[ "${2:-}" != "" ]]; then
         ( sleep "$2"; printf '%s' "${3:-x}" > "$FIFO" 2>/dev/null || true ) &
     fi
     # shellcheck disable=SC2086 # extra args are meant to word-split
-    env PATH="$PWD/tests/bin:$PATH" CGA_TIME_SCALE=0.01 \
+    (
+      cd "$T"
+      env PATH="$REPO/tests/bin:$PATH" CGA_TIME_SCALE=0.01 \
         GLM_QUOTA_URL="http://127.0.0.1:$PORT/api/monitor/usage/quota/limit" \
-        timeout "$1" bunx tsx claude-glm-auto.ts --auto-debug ${4:-} \
-        < "$FIFO" > /tmp/cga-out.bin 2>/tmp/cga-err.txt || true
+        python3 "$REPO/tests/run-with-timeout.py" "$1" node "$REPO/dist/claude-glm-auto.js" --auto-debug ${4:-} \
+        < "$FIFO" > "$T/out.bin" 2>"$T/err.txt" || true
+    )
     kill $holder 2>/dev/null || true
+    wait $holder 2>/dev/null || true
     rm -f "$FIFO"
 }
 
 python3 tests/mock-quota.py "$PORT" "$STATE" & MOCK=$!
-trap 'kill $MOCK 2>/dev/null' EXIT
+trap 'kill $MOCK 2>/dev/null; rm -rf "$T"' EXIT
 sleep 0.5
 
 # ---------------------------------------------------------------- S1 transient
@@ -60,7 +73,7 @@ FAKE_NEXT='-' run_wrapper 6
 check "classified transient"        "Transient API error"             "$LOG" 1
 check "sent continue (transient)"   'Sending "continue" (transient)' "$LOG" 1
 check_absent "no limit wait"        "Limit wait"                      "$LOG"
-check "echo landed"                 "❯ continue"                      /tmp/cga-out.bin
+check "echo landed"                 "❯ continue"                      $T/out.bin
 
 # ------------------------------------------------------------- S2 cert error
 say "S2: self-signed certificate error -> transient (quota full irrelevant)"
@@ -86,10 +99,10 @@ FAKE_BANNER="● API Error: Request rejected (429) · [1308][已达到 5 小时�
 FAKE_NEXT='-' run_wrapper 8
 check "limit wait started"          "Limit wait until"                "$LOG" 1
 check "sent continue (deadline)"    'Sending "continue" (deadline)' "$LOG" 1
-check "countdown title"             "GLM resumes"                     /tmp/cga-out.bin
+check "countdown title"             "GLM resumes"                     $T/out.bin
 
 # ------------------------------------------------------------- S5 early resume
-say "S5: window drops below 95 during the wait -> early resume; bounce -> disabled"
+say "S5: window drops below 100 during the wait -> early resume; bounce -> disabled"
 RESET=$(( $(NOW_MS) + 300000 ))
 set_state "{\"status\":200,\"tokensPct\":100,\"tokensResetMs\":$RESET}"
 ( sleep 4; printf '{"status":200,"tokensPct":50,"tokensResetMs":%s}' "$RESET" > "$STATE" ) &
@@ -99,7 +112,8 @@ FAKE_NEXT="● API Error: Request rejected (429) · [1308][已达到 5 小时的
   run_wrapper 14
 kill $FLIP 2>/dev/null || true
 check "early resume fired"          "resuming early"                  "$LOG" 1
-check "exactly one early resume"    "resuming early"                  "$LOG" 1
+N=$(grep -ac 'Sending "continue" (quota-early)' "$LOG")
+if [[ "$N" == 1 ]]; then ok "exactly one early resume"; else bad "expected one early resume, got $N"; fi
 check "bounce detected"             "Early resume bounced"            "$LOG" 1
 
 # ------------------------------------------------------------------ S6 probe
@@ -122,31 +136,92 @@ check_absent "no continue sent"     'Sending "continue"'              "$LOG"
 
 # --------------------------------------------------- S8 alias install config dir
 say "S8: --install-alias --auto-config-dir pins the dir; the flag never forwards"
-T=$(mktemp -d)
-mkdir -p "$T/.claude_ds"
-HOME="$T" SHELL=/bin/bash bunx tsx claude-glm-auto.ts \
-    --install-alias --auto-config-dir '~/.claude_ds' >/tmp/cga-alias.txt 2>&1
-check "alias pins expanded dir"  "[-]-auto-config-dir \"$T/.claude_ds\"" "$T/.bashrc" 1
-HOME="$T" SHELL=/bin/bash bunx tsx claude-glm-auto.ts \
-    --install-alias --auto-config-dir "$T/.claude_ds" >/dev/null 2>&1
-check "reinstall stays idempotent" "alias claude=" "$T/.bashrc" 1
-if HOME="$T" SHELL=/bin/bash bunx tsx claude-glm-auto.ts \
-    --install-alias --auto-config-dir "$T/missing" >/dev/null 2>&1; then
+ALIAS_HOME="$T/alias-home"
+mkdir -p "$ALIAS_HOME/.claude_ds"
+if [[ $(uname) == Darwin ]]; then RC=.bash_profile; else RC=.bashrc; fi
+HOME="$ALIAS_HOME" SHELL=/bin/bash node dist/claude-glm-auto.js \
+    --install-alias --auto-config-dir '~/.claude_ds' >"$T/alias.txt" 2>&1
+check "alias pins expanded dir"  "[-]-auto-config-dir \"$ALIAS_HOME/.claude_ds\"" "$ALIAS_HOME/$RC" 1
+HOME="$ALIAS_HOME" SHELL=/bin/bash node dist/claude-glm-auto.js \
+    --install-alias --auto-config-dir "$ALIAS_HOME/.claude_ds" >/dev/null 2>&1
+check "reinstall stays idempotent" "alias claude=" "$ALIAS_HOME/$RC" 1
+if HOME="$ALIAS_HOME" SHELL=/bin/bash node dist/claude-glm-auto.js \
+    --install-alias --auto-config-dir "$ALIAS_HOME/missing" >/dev/null 2>&1; then
     bad "missing config dir refused"
 else
     ok "missing config dir refused"
 fi
 # An exported CLAUDE_CONFIG_DIR at install time is frozen into the block too.
-HOME="$T" SHELL=/bin/bash CLAUDE_CONFIG_DIR="$T/.claude_ds" \
-    bunx tsx claude-glm-auto.ts --install-alias >/dev/null 2>&1
-check "env dir frozen into alias" "[-]-auto-config-dir \"$T/.claude_ds\"" "$T/.bashrc" 1
-HOME="$T" SHELL=/bin/bash bunx tsx claude-glm-auto.ts --uninstall-alias >/dev/null 2>&1
-check_absent "uninstall drops the block" "claude-glm-auto" "$T/.bashrc"
+HOME="$ALIAS_HOME" SHELL=/bin/bash CLAUDE_CONFIG_DIR="$ALIAS_HOME/.claude_ds" \
+    node dist/claude-glm-auto.js --install-alias >/dev/null 2>&1
+check "env dir frozen into alias" "[-]-auto-config-dir \"$ALIAS_HOME/.claude_ds\"" "$ALIAS_HOME/$RC" 1
+HOME="$ALIAS_HOME" SHELL=/bin/bash node dist/claude-glm-auto.js --uninstall-alias >/dev/null 2>&1
+check_absent "uninstall drops the block" "claude-glm-auto" "$ALIAS_HOME/$RC"
 # And the flag itself is stripped before forwarding to claude.
-run_wrapper 3 '' '' "--auto-config-dir $T/.claude_ds"
+run_wrapper 3 '' '' "--auto-config-dir $ALIAS_HOME/.claude_ds"
 check "wrapper started"            "===== START ====="                "$LOG" 1
 check_absent "flag not forwarded"  "Forwarding to claude:.*auto-config-dir" "$LOG"
-rm -rf "$T"
+
+# --------------------------------------------------------- S9 multi-account
+say "S9: one account weekly-exhausted, another ready -> retry through relay"
+write_accounts() {
+    printf '{"accounts":[{"id":"a","name":"A","apiKey":"official-a"},{"id":"b","name":"B","apiKey":"official-b"}]}' > "$PROFILE/glm-accounts.json"
+}
+write_accounts
+set_state '{"accounts":{"official-a":{"tokensPct":20,"weeklyPct":100},"official-b":{"tokensPct":40,"weeklyPct":35}}}'
+FAKE_BANNER='● API Error: [1308][已达到每周使用上限，2099-01-01 00:00:00 重置]' FAKE_NEXT='-' run_wrapper 5
+check "relay retry" 'Sending "continue" (transient)' "$LOG"
+check_absent "no single-account long wait" 'Limit wait until' "$LOG"
+
+# --------------------------------------------------------- S10 pool deadline
+say "S10: all accounts blocked -> earliest account recovery (including weekly)"
+RESET=$(( $(NOW_MS) + 5000 ))
+LATER=$(( $(NOW_MS) + 3600000 ))
+set_state "{\"accounts\":{\"official-a\":{\"tokensPct\":100,\"tokensResetMs\":$RESET,\"weeklyPct\":100,\"weeklyResetMs\":$LATER},\"official-b\":{\"tokensPct\":100,\"tokensResetMs\":$RESET,\"weeklyPct\":20}}}"
+FAKE_BANNER='● API Error: [1308][已达到每周使用上限]' FAKE_NEXT='-' run_wrapper 8
+check "pool wait" 'Limit wait until' "$LOG"
+check "pool deadline resumed" 'Sending "continue" (deadline)' "$LOG"
+
+# --------------------------------------------------------- S11 partial failure
+say "S11: unknown account prevents a multi-day wait"
+set_state "{\"accounts\":{\"official-a\":{\"status\":500},\"official-b\":{\"tokensPct\":100,\"tokensResetMs\":$LATER,\"weeklyPct\":100,\"weeklyResetMs\":$LATER}}}"
+FAKE_BANNER='● API Error: [1308][已达到每周使用上限，2099-01-01 00:00:00 重置]' FAKE_NEXT='-' run_wrapper 6
+check_absent "no long wait based on partial data" 'Limit wait until' "$LOG"
+check "bounded probe" 'Sending "continue" (probe)' "$LOG"
+
+# --------------------------------------------------------- S12 gateway stop
+say "S12: gateway balance failure -> visible stop, no model probes"
+FAKE_BANNER='● API Error: 403 Insufficient balance' FAKE_NEXT='-' run_wrapper 5
+check "gateway stop reason" 'Gateway stopped' "$LOG"
+check_absent "no retry on gateway balance" 'Sending "continue"' "$LOG"
+check "visible stop" '自动重试已停止' "$T/out.bin"
+
+# --------------------------------------------------------- S13 add account
+say "S13: third account added during wait -> resume on next poll"
+set_state "{\"accounts\":{\"official-a\":{\"tokensPct\":100,\"tokensResetMs\":$LATER},\"official-b\":{\"tokensPct\":100,\"tokensResetMs\":$LATER},\"official-c\":{\"tokensPct\":20,\"weeklyPct\":15}}}"
+( sleep 4; printf '{"accounts":[{"id":"a","name":"A","apiKey":"official-a"},{"id":"b","name":"B","apiKey":"official-b"},{"id":"c","name":"C","apiKey":"official-c"}]}' > "$PROFILE/glm-accounts.json" ) &
+ADD=$!
+FAKE_BANNER='● API Error: [1308][已达到 5 小时的使用上限]' FAKE_NEXT='-' run_wrapper 9
+wait $ADD
+check "wait entered before addition" 'Limit wait until' "$LOG"
+check "third account early resume" 'Sending "continue" (quota-early)' "$LOG"
+check "title reflects three accounts" 'GLM 未触顶 1/3' "$T/out.bin"
+
+# --------------------------------------------------------- S14 cancel query
+say "S14: user input while quota verification is in flight retires its callback"
+rm "$PROFILE/glm-accounts.json"
+set_state '{"tokensPct":20,"delay":2.2}'
+FAKE_BANNER='● API Error: [1308][已达到 5 小时的使用上限]' FAKE_NEXT='-' run_wrapper 4 0.8 'x'
+check "verification cancelled by input" 'Auto-resume cancelled (user input)' "$LOG"
+check_absent "cancelled query cannot send continue" 'Sending "continue"' "$LOG"
+
+# --------------------------------------------------------- S15 F4 cancel
+say "S15: F4 cancels the active wait without forwarding the key"
+RESET=$(( $(NOW_MS) + 300000 ))
+set_state "{\"tokensPct\":100,\"tokensResetMs\":$RESET}"
+FAKE_BANNER='● API Error: [1308][已达到 5 小时的使用上限]' FAKE_NEXT='-' run_wrapper 5 1 $'\e[14~'
+check "F4 cancels wait" 'Auto-resume cancelled (F4)' "$LOG"
+check_absent "no F4 resume" 'Sending "continue"' "$LOG"
 
 # ------------------------------------------------------------------ summary
 say "SUMMARY"

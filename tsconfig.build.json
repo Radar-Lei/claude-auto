@@ -12,6 +12,8 @@
     "allowImportingTsExtensions": false
   },
   "include": [
-    "claude-glm-auto.ts"
+    "claude-glm-auto.ts",
+    "glm-quota.ts",
+    "statusline.ts"
   ]
 }

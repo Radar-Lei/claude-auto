@@ -27,6 +27,12 @@ def make_handler(state_path: str):
             except Exception:
                 state = {"status": 200, "tokensPct": 50, "tokensResetMs": None}
 
+            if "accounts" in state:
+                state = state["accounts"].get(self.headers.get("Authorization"), {"status": 500})
+            if state.get("delay"):
+                import time
+                time.sleep(state["delay"])
+
             if state.get("status", 200) != 200 or state.get("fail"):
                 self.send_response(500)
                 self.end_headers()
@@ -42,7 +48,12 @@ def make_handler(state_path: str):
             limits = []
             tokens = window(state.get("tokensPct", 0), state.get("tokensResetMs"))
             tokens["type"] = "TOKENS_LIMIT"
+            tokens.update({"unit": 3, "number": 5})
             limits.append(tokens)
+            if "weeklyPct" in state:
+                weekly = window(state["weeklyPct"], state.get("weeklyResetMs"))
+                weekly.update({"type": "TOKENS_LIMIT", "unit": 6, "number": 1})
+                limits.append(weekly)
             monthly = window(state.get("monthlyPct", 0), state.get("monthlyResetMs"))
             monthly["type"] = "TIME_LIMIT"
             monthly.update({
@@ -61,7 +72,10 @@ def make_handler(state_path: str):
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # 超时用例会在接口返回前结束客户端。
 
         def log_message(self, *args):  # silence request logging
             pass

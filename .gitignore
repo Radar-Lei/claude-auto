@@ -33,3 +33,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# Private account credentials and local quota readings
+glm-accounts.json
+glm-quota-cache.json
+glm-quota-cache.json.*.tmp
+__pycache__/

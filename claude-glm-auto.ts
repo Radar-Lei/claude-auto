@@ -5,6 +5,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
 import { createRequire } from 'node:module';
+import { QuotaMonitor, accountAvailability, poolAvailability, formatPool, poolTitle, gatewayStopReason } from './glm-quota.js';
+import type { PoolSnapshot } from './glm-quota.js';
+import { installStatusline } from './statusline.js';
 
 // ==========================================
 // CLI ARGS
@@ -24,26 +27,25 @@ const DEBUG: boolean = process.argv.includes('--auto-debug');
 // config directory the wrapped claude runs on — ~/.claude, ~/.claude_glm,
 // ~/.claude_ds… Claude Code picks its config dir from $CLAUDE_CONFIG_DIR alone,
 // so the flag resolves its value once and exports it, from where two consumers
-// read it: resolveGlmCredentials() (the quota features' credentials live in that
-// dir's settings.json) and the spawned claude itself (via the inherited env).
+// read it: QuotaMonitor (账号列表或官方直连凭据) and the spawned claude itself.
 // Returns the value plus the argv with the flag and its value removed, so the
 // rest of forwarding never sees them. A flag with no value is a usage error —
 // fail loud rather than silently run on the default config dir.
-function parseConfigDirArg(argv: string[]): { value: string | null; rest: string[] } {
+function parseConfigDirArg(argv: string[], flag = CONFIG_DIR_FLAG): { value: string | null; rest: string[] } {
     const rest: string[] = [];
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i] ?? '';
-        if (arg === CONFIG_DIR_FLAG) {
+        if (arg === flag) {
             const value = argv[i + 1];
-            if (value === undefined || value.startsWith('--')) {
-                process.stderr.write(
-                    `claude-glm-auto: ${CONFIG_DIR_FLAG} needs a directory (try ${CONFIG_DIR_FLAG} ~/.claude_glm).\n`);
+            if (!value || value.startsWith('--')) {
+                process.stderr.write(`claude-glm-auto: ${flag} 需要一个路径。\n`);
                 process.exit(1);
             }
             return { value, rest: [...rest, ...argv.slice(i + 2)] };
         }
-        if (arg.startsWith(`${CONFIG_DIR_FLAG}=`)) {
-            return { value: arg.slice(CONFIG_DIR_FLAG.length + 1), rest: [...rest, ...argv.slice(i + 1)] };
+        if (arg.startsWith(`${flag}=`)) {
+            if (!arg.slice(flag.length + 1)) { process.stderr.write(`${flag} 需要一个路径\n`); process.exit(1); }
+            return { value: arg.slice(flag.length + 1), rest: [...rest, ...argv.slice(i + 1)] };
         }
         rest.push(arg);
     }
@@ -72,8 +74,14 @@ if (configDirArg !== null) {
     process.env.CLAUDE_CONFIG_DIR = resolveConfigDir(configDirArg);
 }
 
-// Everything after `node claude-glm-auto.ts`, minus our own flags.
-const cliArgs: string[] = argvRest.filter(arg => !WRAPPER_FLAGS.has(arg));
+const { value: accountsFileArg, rest: forwardedRest } = parseConfigDirArg(argvRest, '--auto-accounts-file');
+const accountsFile = accountsFileArg === null ? undefined : path.resolve(
+    accountsFileArg === '~' || accountsFileArg.startsWith('~/')
+        ? path.join(os.homedir(), accountsFileArg.slice(1)) : accountsFileArg,
+);
+const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
+
+const cliArgs: string[] = forwardedRest.filter(arg => !WRAPPER_FLAGS.has(arg));
 
 // Sessions start in auto mode: we forward `--permission-mode auto` by default, so
 // claude-glm-auto doesn't stop to ask on every tool call — the point of the wrapper is
@@ -125,19 +133,15 @@ const apiErrorRegex: RegExp = /●\s*API Error:/i;
 //   ● API Error: Request rejected (429) · [1308][已达到 5 小时的使用上限。
 //   您的限额将在 2026-09-07 17:00:30 重置。][...]
 //
-// The monthly allowance has its own wording (每周/每月) and its reset is the
-// *monthly* window's, days out. Both are limit-shaped: the request was
-// throttled, so "continue" before the reset would only fail again. Anything
-// else — connection closed mid-response, self-signed certificate, 529
-// overload, stream idle timeout — is transient, however full the quota reads:
-// a high percentage must never turn a transient error into a multi-hour wait.
+// 周额度也可能阻止模型请求，恢复时间需要查询账号池全部窗口。
+// 连接断开、证书故障、过载等走临时重试，不因额度读数高而进入长等待。
 const LIMIT_ERROR_PATTERNS: RegExp[] = [
     /\[?1308\]?/,                            // GLM's 5-hour window error code
-    /已达到[\s\S]{0,40}?使用上限/,             // "…使用上限…" (5-hour and monthly)
+    /已达到[\s\S]{0,40}?使用上限/,
     /usage\s+limit\s+(?:reached|exceeded)/i,  // English wording, just in case
 ];
-// Which window a limit message names — its reset time is the one that counts.
-const MONTHLY_LIMIT_PATTERN: RegExp = /每周|每月/;
+// 周额度属于模型额度；MCP 月额度始终只展示。
+const WEEKLY_LIMIT_PATTERN: RegExp = /每周|周额度|weekly|7.day/i;
 // "2026-09-07 17:00:30" inside a limit message: local time on both ends — the
 // TUI renders local, we parse local — so no timezone to guess.
 const BANNER_RESET_TIME_REGEX: RegExp =
@@ -176,207 +180,11 @@ const PROBE_INTERVAL_MS: number = scaled(5 * 60 * 1000);
 const EARLY_RESUME_FALLBACK_MS: number = scaled(2 * 60 * 60 * 1000);
 
 // ==========================================
-// GLM QUOTA API
+// GLM QUOTA POLLING
 // ==========================================
-// GLM (bigmodel.cn) exposes the quotas that actually gate a session through an
-// authenticated GET — using the very credentials Claude Code itself runs on —
-// so the wrapper reads ground truth instead of scraping a panel. Two windows
-// come back:
-//
-//   TOKENS_LIMIT  the 5-hour rolling token window. This is the one that stops
-//                 a session outright: when it's spent, requests fail with
-//                 error 1308 and a reset time in the message.
-//   TIME_LIMIT    the monthly MCP tool-call allowance. When it's spent only
-//                 MCP calls fail; the model keeps running, so it never blocks
-//                 a session and is displayed, never waited on.
-//
-// Each carries `percentage` (0-100 spent) and `nextResetTime` (epoch ms). That
-// stamp is the authoritative resume time for a spent 5-hour window: no screen
-// parsing, no timezone arithmetic, no am/pm.
-const QUOTA_API_PATH: string = '/api/monitor/usage/quota/limit';
-
-// The monitor endpoint lives on the same host as the Anthropic-compatible API,
-// so the URL is derived from ANTHROPIC_BASE_URL's origin. GLM_QUOTA_URL
-// overrides it wholesale — that's the seam the E2E mock plugs into.
-const QUOTA_URL_OVERRIDE_ENV: string = 'GLM_QUOTA_URL';
-
-// Standing poll cadence for the title bar, and how long a request may take.
-// Five minutes matches how fast a 5-hour window visibly moves; a slow poll
-// never blocks anything (detection and resumes don't wait on it).
 const QUOTA_POLL_INTERVAL_MS: number = scaled(5 * 60 * 1000);
-const QUOTA_FETCH_TIMEOUT_MS: number = 8000;
-
-// Consecutive failed polls back off exponentially up to this — the API is a
-// nicety, and a struggling monitor endpoint must not be hammered.
-const QUOTA_BACKOFF_MAX_MS: number = 20 * 60 * 1000;
-
-// After a failure, no *error-triggered* confirmation query before this long
-// (the standing poll is unaffected): a banner seen while the quota API is down
-// shouldn't re-query it every 2-second screen capture.
-const QUOTA_RETRY_AFTER_FAIL_MS: number = 60 * 1000;
-
-// A limit is confirmed when the 5-hour window reads at least this spent, on a
-// query that follows a limit-shaped banner. 1308 means the window is truly
-// full, but between the request failing and our query landing, tokens can age
-// out of the rolling window — 95 leaves room for that drift while still being
-// a reading the API only reports when the window is effectively spent. The
-// same number doubles as the early-resume line: a window that has fallen back
-// below it during a countdown has room again.
-const LIMIT_CONFIRM_PCT: number = 95;
-
-// Title-bar thresholds: warn on the 5-hour window from here, and mention the
-// monthly MCP allowance from here (it stays off the title otherwise — it never
-// blocks a session, so it doesn't deserve the width).
-const QUOTA_WARN_PCT: number = 85;
-const MCP_WARN_PCT: number = 90;
-
-interface GlmCredentials {
-    baseUrl: string;
-    token: string;
-}
-
-// Resolved once at startup. Exported env vars win (an explicit override), then
-// the settings.json Claude Code itself reads — $CLAUDE_CONFIG_DIR if set,
-// ~/.claude otherwise — whose `env` block carries the GLM base URL and token.
-// A half-pair from either source is not combined across sources: mixing a
-// token from one place with a base URL from another is how silent wrong-account
-// reads happen, so each source has to be complete on its own or we return null
-// and every quota feature quietly stays off. The session itself never depends
-// on them.
-function resolveGlmCredentials(): GlmCredentials | null {
-    const pair = (baseUrl: string | undefined, token: string | undefined): GlmCredentials | null =>
-        baseUrl && token ? { baseUrl, token } : null;
-
-    const fromEnv: GlmCredentials | null =
-        pair(process.env.ANTHROPIC_BASE_URL, process.env.ANTHROPIC_AUTH_TOKEN);
-    if (fromEnv !== null) return fromEnv;
-
-    const configDir: string = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
-    try {
-        const settings = JSON.parse(
-            fs.readFileSync(path.join(configDir, 'settings.json'), 'utf8'),
-        ) as { env?: Record<string, string | undefined> };
-        return pair(settings.env?.ANTHROPIC_BASE_URL, settings.env?.ANTHROPIC_AUTH_TOKEN);
-    } catch {
-        return null; // no settings.json, or not JSON — nothing to read there
-    }
-}
-
-// The monitor URL for a base URL, or null when the base URL isn't parseable.
-// origin normalises protocol/host/port and drops the /api/anthropic path.
-function quotaApiUrl(baseUrl: string): string | null {
-    try {
-        return new URL(baseUrl).origin + QUOTA_API_PATH;
-    } catch {
-        return null;
-    }
-}
-
-interface QuotaWindow {
-    percentage: number;           // percent of the window spent (0-100)
-    nextResetTime: number | null; // epoch ms; null when absent or implausible
-    currentUsage: number | null;  // TIME_LIMIT only: calls made this month
-    capacity: number | null;      // TIME_LIMIT only: calls allowed per month
-}
-
-interface QuotaSnapshot {
-    tokens: QuotaWindow | null;  // TOKENS_LIMIT — the 5-hour window
-    monthly: QuotaWindow | null; // TIME_LIMIT — monthly MCP calls (display only)
-    fetchedAt: number;           // Date.now() at parse, for staleness marks
-}
-
-// One window out of a limits[] entry, or null when the entry isn't usable.
-// percentage and nextResetTime are validated *independently*: a garbled stamp
-// must not throw away a valid percentage (the title bar still wants it), nor a
-// valid stamp a garbled percentage. A stamp outside (now-1h, now+35d) is
-// treated as absent rather than trusted: a month covers the monthly window
-// with room to spare, and an hour of clock skew still lets a *just-past* reset
-// through to the countdown clamp instead of dying here.
-function parseQuotaWindow(entry: unknown, now: number): QuotaWindow | null {
-    if (typeof entry !== 'object' || entry === null) return null;
-    const fields = entry as {
-        percentage?: unknown;
-        nextResetTime?: unknown;
-        currentValue?: unknown;
-        usage?: unknown;
-    };
-
-    const pct: number =
-        typeof fields.percentage === 'number' && Number.isFinite(fields.percentage)
-            ? fields.percentage
-            : Number.NaN;
-    if (Number.isNaN(pct)) return null;
-
-    const stamp: number =
-        typeof fields.nextResetTime === 'number' && Number.isFinite(fields.nextResetTime)
-            ? fields.nextResetTime
-            : Number.NaN;
-    const reset: number | null = !Number.isNaN(stamp)
-        && stamp > now - 60 * 60 * 1000
-        && stamp < now + 35 * 24 * 60 * 60 * 1000
-        ? stamp
-        : null;
-
-    const count = (v: unknown): number | null =>
-        typeof v === 'number' && Number.isFinite(v) ? v : null;
-
-    return {
-        percentage: pct,
-        nextResetTime: reset,
-        currentUsage: count(fields.currentValue),
-        capacity: count(fields.usage),
-    };
-}
-
-// The raw JSON body into a snapshot, or null when it isn't the shape we came
-// for. Strictness here is cheap insurance: anything doubtful becomes null, and
-// every consumer treats null as "no data" — never as "no limit".
-function parseQuotaResponse(body: unknown): QuotaSnapshot | null {
-    if (typeof body !== 'object' || body === null) return null;
-    const { code, data } = body as { code?: unknown; data?: unknown };
-    if (code !== 200 || typeof data !== 'object' || data === null) return null;
-
-    const limits: unknown = (data as { limits?: unknown }).limits;
-    if (!Array.isArray(limits)) return null;
-
-    const now: number = Date.now();
-    let tokens: QuotaWindow | null = null;
-    let monthly: QuotaWindow | null = null;
-    for (const entry of limits) {
-        const type: unknown = (entry as { type?: unknown }).type;
-        if (type === 'TOKENS_LIMIT' && tokens === null) tokens = parseQuotaWindow(entry, now);
-        if (type === 'TIME_LIMIT' && monthly === null) monthly = parseQuotaWindow(entry, now);
-    }
-    if (tokens === null && monthly === null) return null;
-    return { tokens, monthly, fetchedAt: now };
-}
-
-// Fetch and parse in one step. Authorization is the bare token — GLM's monitor
-// API wants no Bearer prefix. The token never reaches a log line: failures log
-// at most an HTTP status or the error's *name*, never its message.
-async function fetchQuotaSnapshot(creds: GlmCredentials): Promise<QuotaSnapshot | null> {
-    const url: string = process.env[QUOTA_URL_OVERRIDE_ENV] ?? quotaApiUrl(creds.baseUrl) ?? '';
-    if (url === '') {
-        log('quota API: base URL not parseable');
-        return null;
-    }
-    try {
-        const res = await fetch(url, {
-            headers: { authorization: creds.token },
-            signal: AbortSignal.timeout(QUOTA_FETCH_TIMEOUT_MS),
-        });
-        if (!res.ok) {
-            log(`quota API: HTTP ${res.status}`);
-            return null;
-        }
-        const snap = parseQuotaResponse(await res.json());
-        if (snap === null) log('quota API: response not in the expected shape');
-        return snap;
-    } catch (err) {
-        log(`quota API: ${err instanceof Error ? err.name : 'request failed'}`);
-        return null;
-    }
-}
+const QUOTA_BACKOFF_MAX_MS: number = scaled(20 * 60 * 1000);
+const quotaMonitor = new QuotaMonitor({ configDir, accountsFile, cacheTtlMs: QUOTA_POLL_INTERVAL_MS });
 
 // Claude sometimes offers a "Stop and wait for limit to reset" menu; we select it
 // (press Enter) so the session parks until reset. Wait briefly so the menu has
@@ -446,7 +254,7 @@ const LOG_FILE: string = path.join(process.cwd(), 'claude-glm-auto.log');
 function log(msg: string): void {
     if (!DEBUG) return;
     try {
-        fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`);
+        fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${quotaMonitor.redact(msg)}\n`);
     } catch {
         /* logging must never crash the wrapper */
     }
@@ -489,7 +297,8 @@ interface AliasTarget {
 // The path is double-quoted: inside bash/zsh's single-quoted alias body a double
 // quote is literal, and it keeps a path with spaces one argument for the wrapper.
 function posixConfigClause(configDir: string | null): string {
-    return configDir === null ? '' : ` ${CONFIG_DIR_FLAG} "${configDir}"`;
+    return (configDir === null ? '' : ` ${CONFIG_DIR_FLAG} "${configDir}"`)
+        + (accountsFile ? ` --auto-accounts-file "${accountsFile}"` : '');
 }
 
 // Which file a POSIX shell actually re-reads on launch. Nothing here is a guess
@@ -537,9 +346,9 @@ function powershellTargets(configDir: string | null): AliasTarget[] {
                 targets.push({
                     shell: exe,
                     file,
-                    line: configDir === null
+                    line: configDir === null && !accountsFile
                         ? 'Set-Alias claude claude-glm-auto'
-                        : `function claude { claude-glm-auto ${CONFIG_DIR_FLAG} '${configDir.replace(/'/g, "''")}' @args }`,
+                        : `function claude { claude-glm-auto${configDir ? ` ${CONFIG_DIR_FLAG} '${configDir.replace(/'/g, "''")}'` : ''}${accountsFile ? ` --auto-accounts-file '${accountsFile.replace(/'/g, "''")}'` : ''} @args }`,
                     reload: `. $PROFILE`
                 });
             }
@@ -723,59 +532,30 @@ if (process.argv.includes(ALIAS_INSTALL_FLAG) || process.argv.includes(ALIAS_UNI
 // request and parser all exercised without a session) and a handy CLI besides.
 const QUOTA_FLAG: string = '--glm-quota';
 
-function formatDuration(ms: number): string {
-    const totalMinutes: number = Math.max(0, Math.round(ms / 60000));
-    const h: number = Math.floor(totalMinutes / 60);
-    const m: number = totalMinutes % 60;
-    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+async function printQuotaAndExit(): Promise<never> {
+    const snap = await quotaMonitor.read();
+    process.stdout.write(forwardedRest.includes('--json')
+        ? JSON.stringify(snap, null, 2) + '\n' : formatPool(snap) + '\n');
+    process.exit(snap.configError || snap.accounts.every(a => a.error) ? 1 : 0);
 }
 
-async function printQuotaAndExit(): Promise<never> {
-    const creds: GlmCredentials | null = resolveGlmCredentials();
-    if (creds === null) {
-        process.stderr.write(
-            'claude-glm-auto: no GLM credentials found.\n' +
-            '  Export ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN, or point\n' +
-            '  CLAUDE_CONFIG_DIR at a settings.json whose env block has them.\n',
-        );
+if (forwardedRest.includes('--install-statusline')) {
+    try {
+        const file = installStatusline(configDir, accountsFile);
+        process.stdout.write(`已配置状态栏：${file}\n原设置备份：${file}.before-glm-statusline\n`);
+        process.exit(0);
+    } catch {
+        process.stderr.write('状态栏安装失败，请检查配置目录内的 settings.json 是否可读写且为有效 JSON。\n');
         process.exit(1);
     }
-
-    const snap: QuotaSnapshot | null = await fetchQuotaSnapshot(creds);
-    if (snap === null || snap.tokens === null) {
-        process.stderr.write('claude-glm-auto: quota API request failed.\n');
-        process.exit(1);
-    }
-
-    const host: string = new URL(creds.baseUrl).host;
-    const lines: string[] = [`GLM quota (${host}, fetched ${new Date().toLocaleTimeString()})`];
-
-    const tokens: QuotaWindow = snap.tokens;
-    const reset: string = tokens.nextResetTime === null
-        ? 'reset time unknown'
-        : `resets ${new Date(tokens.nextResetTime).toLocaleString()}`;
-    lines.push(`  5h token window : ${tokens.percentage}% used, ${reset}` +
-        (tokens.nextResetTime === null ? '' : ` (${formatDuration(tokens.nextResetTime - Date.now())} from now)`));
-
-    if (snap.monthly !== null) {
-        const calls: string = snap.monthly.currentUsage !== null && snap.monthly.capacity !== null
-            ? ` (${snap.monthly.currentUsage}/${snap.monthly.capacity} calls)`
-            : '';
-        const monthlyReset: string = snap.monthly.nextResetTime === null
-            ? 'reset time unknown'
-            : `resets ${new Date(snap.monthly.nextResetTime).toLocaleString()}`;
-        lines.push(`  MCP monthly     : ${snap.monthly.percentage}% used${calls}, ${monthlyReset}`);
-    }
-
-    process.stdout.write(lines.join('\n') + '\n');
+}
+if (forwardedRest.includes('--statusline')) {
+    // 状态栏按标准协议读取会话输入，额度由共享模块独立查询。
+    for await (const _chunk of process.stdin) { /* 消耗会话 JSON。 */ }
+    process.stdout.write(formatPool(await quotaMonitor.read(true), true) + '\n');
     process.exit(0);
 }
-
-// Top-level await keeps the pty (and Claude itself) from spawning underneath an
-// in-flight probe: nothing below this line runs until the probe has exited.
-if (process.argv.includes(QUOTA_FLAG)) {
-    await printQuotaAndExit();
-}
+if (forwardedRest.includes(QUOTA_FLAG)) await printQuotaAndExit();
 
 // ==========================================
 // SELF-CALL GUARD
@@ -913,27 +693,10 @@ function restoreTitle(): void {
     setTitle(composeTitle());
 }
 
-// The quota leg of the title bar, e.g. "GLM 5h 82% →2h 48m": current spend of
-// the 5-hour window and how long until the window's next shift (the moment the
-// oldest tokens in it age out — during a limit wait, that *is* the resume
-// time). " ⚠" appears from QUOTA_WARN_PCT, "?" when the reading predates a
-// failed poll, " · MCP 91%" when the monthly allowance is nearly gone. Empty
-// until the first reading — Claude's title then stands alone.
+// 标题汇总账号池；具体窗口在查询命令和底部状态栏展示。
 function quotaSuffix(): string {
-    const snap: QuotaSnapshot | null = lastQuota;
-    if (snap === null || snap.tokens === null) return '';
-    const tokens: QuotaWindow = snap.tokens;
-
-    let suffix: string = `GLM 5h ${Math.round(tokens.percentage)}%`;
-    if (tokens.percentage >= QUOTA_WARN_PCT) suffix += ' ⚠';
-    if (tokens.nextResetTime !== null) {
-        suffix += ` →${formatDuration(tokens.nextResetTime - Date.now())}`;
-    }
-    if (quotaStale) suffix += '?';
-    if (snap.monthly !== null && snap.monthly.percentage >= MCP_WARN_PCT) {
-        suffix += ` · MCP ${Math.round(snap.monthly.percentage)}%`;
-    }
-    return suffix;
+    if (gatewayBlockedReason) return `${gatewayBlockedReason} · 自动重试已停止`;
+    return lastQuota === null ? '' : poolTitle(lastQuota);
 }
 
 // Claude's own title plus the quota suffix. Composed from the raw childTitle
@@ -958,70 +721,40 @@ function renderTitle(): void {
 // ==========================================
 // QUOTA POLLING
 // ==========================================
-// A standing poll keeps the title bar current and — once P4 wires it in —
-// gives a running limit wait its early-resume signal. It's fire-and-forget:
-// nothing in the wrapper ever waits on it, and it dies with the session.
-// Failed polls back off exponentially and mark the last reading stale ("?" in
-// the title) rather than dropping it — a questioned reading beats none.
-const glmCredentials: GlmCredentials | null = resolveGlmCredentials();
-
+// 每轮读取账号列表，自动纳入新增账号和套餐变化。
 let quotaPollTimer: NodeJS.Timeout | null = null;
 let quotaBackoffMs: number = QUOTA_POLL_INTERVAL_MS;
-let lastQuota: QuotaSnapshot | null = null;
-let quotaStale: boolean = false; // the last reading predates a failed poll
+let lastQuota: PoolSnapshot | null = null;
+let quotaPollingStopped = false;
+let gatewayBlockedReason: string | null = null;
 
 function startQuotaPolling(): void {
-    if (glmCredentials === null) {
-        log('quota polling off: no GLM credentials found');
-        return;
-    }
-    void pollQuota(); // first reading immediately, the next one scheduled off it
+    quotaPollingStopped = false;
+    void pollQuota();
 }
 
 function stopQuotaPolling(): void {
-    if (quotaPollTimer !== null) {
-        clearTimeout(quotaPollTimer);
-        quotaPollTimer = null;
-    }
+    quotaPollingStopped = true;
+    if (quotaPollTimer !== null) clearTimeout(quotaPollTimer);
+    quotaPollTimer = null;
 }
 
-// setTimeout-chained rather than setInterval: a poll that runs long or a
-// backed-off gap can never stack a second request on top of a pending one.
 function scheduleNextPoll(delayMs: number): void {
-    stopQuotaPolling();
+    if (quotaPollingStopped) return;
+    if (quotaPollTimer !== null) clearTimeout(quotaPollTimer);
     quotaPollTimer = setTimeout(() => { void pollQuota(); }, delayMs);
 }
 
 async function pollQuota(): Promise<void> {
-    const snap: QuotaSnapshot | null =
-        glmCredentials === null ? null : await fetchQuotaSnapshot(glmCredentials);
-
-    if (snap === null) {
-        if (lastQuota !== null) quotaStale = true;
-        quotaBackoffMs = Math.min(quotaBackoffMs * 2, QUOTA_BACKOFF_MAX_MS);
-        log(`quota poll failed — next attempt in ${Math.round(quotaBackoffMs / 60000)} min`);
-        renderTitle();
-        scheduleNextPoll(quotaBackoffMs);
-        return;
-    }
-
-    quotaBackoffMs = QUOTA_POLL_INTERVAL_MS;
-    quotaStale = false;
+    const snap = await quotaMonitor.read();
+    if (quotaPollingStopped) return;
     lastQuota = snap;
-    const tokens: QuotaWindow | null = snap.tokens;
-    if (tokens !== null) {
-        const monthly: string = snap.monthly !== null ? `, MCP ${snap.monthly.percentage}%` : '';
-        log(`quota: 5h ${tokens.percentage}%${monthly}` +
-            (tokens.nextResetTime === null
-                ? ''
-                : `, resets ${new Date(tokens.nextResetTime).toLocaleTimeString()}`));
-        if (tokens.percentage >= QUOTA_WARN_PCT) {
-            log(`5-hour window at ${tokens.percentage}% — closing on the limit`);
-        }
-        considerEarlyResume(tokens);
-    }
+    const failed = snap.configError !== null || snap.accounts.some(a => a.error !== null);
+    quotaBackoffMs = failed ? Math.min(quotaBackoffMs * 2, QUOTA_BACKOFF_MAX_MS) : QUOTA_POLL_INTERVAL_MS;
+    log(`quota: ${snap.configError ?? poolTitle(snap)}`);
+    considerEarlyResume(snap);
     renderTitle();
-    scheduleNextPoll(QUOTA_POLL_INTERVAL_MS);
+    scheduleNextPoll(isWaiting ? QUOTA_POLL_INTERVAL_MS : quotaBackoffMs);
 }
 
 // ==========================================
@@ -1092,14 +825,14 @@ process.stdin.resume();
 // pending wait is cancelled so our Ctrl-U+continue can never wipe a draft
 // they're typing. F4 (swallowed, never forwarded) does the same on purpose.
 process.stdin.on('data', (data: string) => {
-    if (isWaiting && F4_SEQUENCES.some(seq => data.includes(seq))) {
+    if ((isAutoResumePending() || isVerifying) && F4_SEQUENCES.some(seq => data.includes(seq))) {
         let rest = data;
         for (const seq of F4_SEQUENCES) rest = rest.split(seq).join('');
         cancelAllWaits('F4');
         if (rest.length > 0) ptyProcess.write(rest);
         return;
     }
-    if (isAutoResumePending()) cancelAllWaits('user input');
+    if (isAutoResumePending() || isVerifying) cancelAllWaits('user input');
     ptyProcess.write(data);
 });
 
@@ -1349,7 +1082,6 @@ function detectLimit(screen: string): void {
 const ERROR_TAIL_CHARS: number = 240;
 
 let resumeEpoch: number = 0;           // bumped on cancel/exit; retires stale async work
-let quotaApiRetryUntil: number = 0;    // no error-triggered API query before this
 let resumeSentGraceUntil: number = 0;  // a resume just went out; let its echo land
 let transientTimer: NodeJS.Timeout | null = null;
 let transientTier: number = 0;         // rung on TRANSIENT_DELAYS_MS (0 = first failure)
@@ -1357,9 +1089,7 @@ let cleanCaptureTicks: number = 0;     // consecutive captures with no new error
 let probeTimer: NodeJS.Timeout | null = null;
 let limitDeadline: number | null = null; // epoch ms; null = probing without one
 let waitStartedAt: number = 0;
-let limitWaitMonthly: boolean = false; // the wait is for the monthly allowance
-let windowHighSeen: boolean = false;   // the window verifiably read spent (or 1308 said so)
-let lowStreak: number = 0;             // consecutive polls reading below the confirm line
+let lastEarlyReadyIds: string[] = [];
 let earlyResumeDisabledUntil: number = 0; // an early resume bounced: deadlines only
 let lastResumeWasEarly: boolean = false;
 
@@ -1457,22 +1187,19 @@ function scheduleTransientRetry(tail: string): void {
 // once, here: a deadline already in the past (clock skew, a window that
 // shifted while we queried) still leaves MIN_WAIT_MS before the resume, and
 // later information replaces the deadline rather than re-flooring it.
-function startLimitWait(deadline: number | null, monthly: boolean): void {
+function startLimitWait(deadline: number | null): void {
     const now: number = Date.now();
     if (deadline !== null && deadline < now + MIN_WAIT_MS) deadline = now + MIN_WAIT_MS;
 
     limitDeadline = deadline;
     waitStartedAt = now;
-    limitWaitMonthly = monthly;
-    lowStreak = 0;
-    windowHighSeen = true; // the banner itself: this request was throttled
 
     isWaiting = true;
     titleOverridden = true;
+    scheduleNextPoll(QUOTA_POLL_INTERVAL_MS);
 
     if (deadline !== null) {
-        log(`Limit wait until ${new Date(deadline).toLocaleString()}` +
-            (monthly ? ' (monthly allowance)' : ' (5-hour window)'));
+        log(`Limit wait until ${new Date(deadline).toLocaleString()} (account pool)`);
         startCountdownTicks();
         return;
     }
@@ -1489,7 +1216,8 @@ function startCountdownTicks(): void {
             const h: number = Math.floor(totalSeconds / 3600);
             const m: number = Math.floor((totalSeconds % 3600) / 60);
             const s: number = totalSeconds % 60;
-            const timeStr: string = `${h > 0 ? h + 'h ' : ''}${m}m ${s}s`;
+            const days = Math.floor(h / 24);
+            const timeStr = `${days ? days + 'd ' : ''}${h % 24 ? h % 24 + 'h ' : ''}${m}m ${s}s`;
             setTitle(`⏳ GLM resumes: ${timeStr}`);
             return;
         }
@@ -1503,132 +1231,113 @@ function startCountdownTicks(): void {
     }, 1000);
 }
 
-// No deadline: every PROBE_INTERVAL_MS, re-query for a reset time (an upgrade
-// to a real countdown) and send one probing "continue". If the quota API is
-// down too, the probe still goes out alone — a transient error heals on it,
-// and a true limit can only fail it.
+// 不完整的额度信息只能支持有间隔的恢复尝试，不能支持数天倒计时。
 function scheduleProbe(): void {
     if (probeTimer !== null) clearTimeout(probeTimer);
     probeTimer = setTimeout(() => {
         probeTimer = null;
         if (!isWaiting) return;
-        const myEpoch: number = resumeEpoch;
-        void (async (): Promise<void> => {
-            if (glmCredentials !== null) {
-                const snap: QuotaSnapshot | null = await fetchQuotaSnapshot(glmCredentials);
-                if (resumeEpoch !== myEpoch) return;
-                const window: QuotaWindow | null = snap?.tokens ?? null;
-                if (window !== null && window.nextResetTime !== null) {
-                    let deadline: number = window.nextResetTime + WAIT_BUFFER_MS;
-                    if (deadline < Date.now() + MIN_WAIT_MS) deadline = Date.now() + MIN_WAIT_MS;
-                    log(`Probe found a reset time — counting down to ${new Date(deadline).toLocaleTimeString()}`);
-                    limitDeadline = deadline;
-                    if (probeTimer !== null) {
-                        clearTimeout(probeTimer);
-                        probeTimer = null;
-                    }
-                    startCountdownTicks();
-                    return;
-                }
-            }
+        const myEpoch = resumeEpoch;
+        void (async () => {
+            const snap = await quotaMonitor.read();
             if (resumeEpoch !== myEpoch || !isWaiting) return;
+            lastQuota = snap;
+            const state = poolAvailability(snap);
+            if (state.state === 'blocked' && state.resetAt !== null) {
+                limitDeadline = Math.max(state.resetAt + WAIT_BUFFER_MS, waitStartedAt + MIN_WAIT_MS);
+                log(`Probe found a reset time — counting down to ${new Date(limitDeadline).toLocaleString()}`);
+                startCountdownTicks();
+                return;
+            }
             trySendResume('probe');
-            if (isWaiting) scheduleProbe(); // a held send tries again next round
+            if (isWaiting) scheduleProbe();
         })();
     }, PROBE_INTERVAL_MS);
 }
 
-// A fresh reading arrived while a limit wait runs. The 5-hour window reading
-// back below the confirm line — twice, if no spent reading was ever seen —
-// means capacity is back (old tokens aged out ahead of the deadline); resume
-// now rather than waiting the clock out. Monthly waits ignore this: their
-// window is the monthly one, and the 5-hour reading says nothing about it.
-function considerEarlyResume(tokens: QuotaWindow): void {
-    if (!isWaiting || limitWaitMonthly) return;
-    if (Date.now() < earlyResumeDisabledUntil) return;
-    if (Date.now() - waitStartedAt < MIN_WAIT_MS) return;
-
-    if (tokens.percentage >= LIMIT_CONFIRM_PCT) {
-        windowHighSeen = true;
-        lowStreak = 0;
+function considerEarlyResume(snap: PoolSnapshot): void {
+    if (!isWaiting || Date.now() - waitStartedAt < MIN_WAIT_MS) return;
+    // 到期后的重试仍交给既有倒计时出口，避免“刚过重置时间”的读数撤销发送。
+    if (limitDeadline !== null && Date.now() >= limitDeadline) return;
+    const state = poolAvailability(snap);
+    if (state.state === 'blocked' && state.resetAt !== null) {
+        limitDeadline = Math.max(state.resetAt + WAIT_BUFFER_MS, waitStartedAt + MIN_WAIT_MS);
+        if (countdownInterval === null) {
+            if (probeTimer !== null) clearTimeout(probeTimer);
+            probeTimer = null;
+            startCountdownTicks();
+        }
         return;
     }
-    lowStreak++;
-    if (lowStreak < (windowHighSeen ? 1 : 2)) return;
-
-    log(`5-hour window back down to ${tokens.percentage}% — resuming early`);
+    if (state.state === 'unknown' || (state.state === 'blocked' && state.resetAt === null)) {
+        if (countdownInterval !== null) clearInterval(countdownInterval);
+        countdownInterval = null;
+        limitDeadline = null;
+        if (probeTimer === null) scheduleProbe();
+        return;
+    }
+    const readyIds = snap.accounts.filter(a => accountAvailability(a).state === 'ready').map(a => a.id);
+    if (Date.now() < earlyResumeDisabledUntil && readyIds.every(id => lastEarlyReadyIds.includes(id))) return;
+    log('Account pool has capacity — resuming early');
     if (trySendResume('quota-early')) {
         lastResumeWasEarly = true;
+        lastEarlyReadyIds = readyIds;
     }
 }
 
-// Classify a live API error and start the right kind of wait. Screen evidence
-// leads: a limit-shaped banner puts us in a limit wait whatever the quota API
-// says, and a non-limit banner climbs the transient ladder however full the
-// window reads. Inside a limit wait the quota API's job is only to supply the
-// precise deadline and, later, the early-resume signal.
 function handleApiError(screen: string): void {
     const error = lastMatch(screen, apiErrorRegex);
-    if (error === null) return;
-
-    if (alreadyHandledPast(screen, error.index)) {
-        log('API error sits above a resume we already sent — ignoring as stale');
+    if (error === null || alreadyHandledPast(screen, error.index)) {
+        if (gatewayBlockedReason !== null) {
+            gatewayBlockedReason = null;
+            renderTitle();
+        }
         return;
     }
-    // A pending wait/timer owns this error already, and a just-sent resume is
-    // waiting for its echo — neither needs a second claim.
     if (isAutoResumePending() || Date.now() < resumeSentGraceUntil) return;
-
-    cleanCaptureTicks = 0; // a new error event ends any clean run
-    const tail: string = screen.slice(error.index, error.index + ERROR_TAIL_CHARS);
-    const isLimit: boolean = LIMIT_ERROR_PATTERNS.some(re => re.test(tail));
-
+    cleanCaptureTicks = 0;
+    const tail = screen.slice(error.index, error.index + ERROR_TAIL_CHARS);
+    const stop = gatewayStopReason(tail);
+    if (stop !== null) {
+        if (gatewayBlockedReason !== stop) log(`Gateway stopped: ${stop}`);
+        gatewayBlockedReason = stop;
+        renderTitle();
+        return;
+    }
+    gatewayBlockedReason = null;
+    const isLimit = LIMIT_ERROR_PATTERNS.some(re => re.test(tail))
+        || WEEKLY_LIMIT_PATTERN.test(tail) && /limit|上限|耗尽/i.test(tail);
     if (!isLimit) {
         scheduleTransientRetry(tail);
         return;
     }
-
-    // Limit-shaped: resolve the best deadline — quota API first (precise; the
-    // monthly window if the message names it), then the banner's own time,
-    // then none (probe loop).
     isVerifying = true;
-    const myEpoch: number = resumeEpoch;
-    void (async (): Promise<void> => {
+    const myEpoch = resumeEpoch;
+    void (async () => {
         try {
-            const monthly: boolean = MONTHLY_LIMIT_PATTERN.test(tail);
-            let deadline: number | null = null;
-
-            if (glmCredentials !== null && Date.now() >= quotaApiRetryUntil) {
-                const snap: QuotaSnapshot | null = await fetchQuotaSnapshot(glmCredentials);
-                if (resumeEpoch !== myEpoch) return;
-                if (snap === null) {
-                    quotaApiRetryUntil = Date.now() + QUOTA_RETRY_AFTER_FAIL_MS;
-                    log('quota API unusable while confirming a limit — falling back');
-                } else {
-                    const window: QuotaWindow | null = monthly ? snap.monthly : snap.tokens;
-                    if (window !== null && window.nextResetTime !== null) {
-                        deadline = window.nextResetTime + WAIT_BUFFER_MS;
-                    }
-                }
-            }
+            const snap = await quotaMonitor.read();
             if (resumeEpoch !== myEpoch) return;
-            if (deadline === null) {
-                const bannerTime: number | null = parseBannerResetTime(tail);
+            lastQuota = snap;
+            const state = poolAvailability(snap);
+            let deadline = state.state === 'blocked' && state.resetAt !== null ? state.resetAt + WAIT_BUFFER_MS : null;
+            // 中转站的报错时间可能只属于一个账号，不能代表整个账号池。
+            if (snap.source === 'direct' && state.state === 'unknown') {
+                const bannerTime = parseBannerResetTime(tail);
                 if (bannerTime !== null) deadline = bannerTime + WAIT_BUFFER_MS;
             }
-
-            // An early resume that bounced straight back means the window
-            // wasn't really clear: this wait trusts only its hard deadline.
+            if (snap.accounts.some(a => a.error) || snap.configError) log('quota API unusable while confirming a limit — falling back');
             if (lastResumeWasEarly) {
                 lastResumeWasEarly = false;
                 earlyResumeDisabledUntil = deadline ?? (Date.now() + EARLY_RESUME_FALLBACK_MS);
-                log(`Early resume bounced — early resume off until ${new Date(earlyResumeDisabledUntil).toLocaleTimeString()}`);
+                log('Early resume bounced — suppressing the same early-resume signal');
+                startLimitWait(deadline);
+            } else if (state.state === 'ready') {
+                scheduleTransientRetry('Account pool has capacity; retry through relay');
+            } else {
+                startLimitWait(deadline);
             }
-
-            startLimitWait(deadline, monthly);
         } finally {
             isVerifying = false;
         }
     })();
 }
-

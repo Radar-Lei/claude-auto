@@ -1,7 +1,7 @@
 {
   "name": "claude-glm-auto",
   "version": "1.0.0",
-  "description": "Auto-continue for Claude Code on GLM (bigmodel.cn): watches the 5-hour token window via the GLM quota API, shows it in the title bar, and resumes when the limit resets",
+  "description": "Multi-account GLM quota monitoring and auto-continue for Claude Code, with 5-hour and weekly limits, relay support and a shared status line",
   "keywords": ["glm", "claude-code", "bigmodel", "zhipu", "auto-resume", "auto-continue", "quota"],
   "license": "MIT",
   "repository": {
@@ -18,6 +18,7 @@
   },
   "files": [
     "dist",
+    "glm-accounts.example.json",
     "README.md",
     "LICENSE"
   ],
@@ -36,7 +37,9 @@
     "node-pty": "^1.1.0"
   },
   "scripts": {
-    "claude": "bunx tsx claude-glm-auto.ts",
+    "claude": "tsx claude-glm-auto.ts",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "test:e2e": "bash tests/e2e.sh",
     "typecheck": "tsc --noEmit",
     "build": "tsc --project tsconfig.build.json"
   }

@@ -6,8 +6,8 @@ import * as path from 'node:path';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { QuotaMonitor, parseQuotaResponse, poolAvailability, accountAvailability, formatPool, gatewayStopReason, describeQuotaError } from '../glm-quota.js';
-import type { QuotaSnapshot, PoolSnapshot, AccountQuota } from '../glm-quota.js';
+import { QuotaMonitor, parseQuotaResponse, poolAvailability, accountAvailability, formatPool, formatReset, gatewayStopReason, describeQuotaError } from '../glm-quota.js';
+import type { QuotaSnapshot, PoolSnapshot, AccountQuota, QuotaWindow } from '../glm-quota.js';
 
 const now = Date.now();
 const hour = 3600e3;
@@ -195,6 +195,19 @@ test('状态栏安装跨目录可运行、保留设置和备份；查询命令�
     assert.equal(json.code, 1);
     assert.ok(JSON.parse(json.stdout).configError);
     assert.equal(json.stderr, '');
+});
+
+test('紧凑状态栏附带重置时刻：当天仅时分，跨天带月日，零消耗无时间', () => {
+    const base = new Date(2026, 9, 20, 10, 0).getTime();
+    assert.equal(formatReset(base + 2 * hour, base), '12:00');
+    assert.equal(formatReset(new Date(2026, 9, 26, 20, 3).getTime(), base), '10/26 20:03');
+    assert.equal(formatReset(null, base), '');
+    const window = (percentage: number, nextResetTime: number | null): QuotaWindow => ({ percentage, nextResetTime, currentUsage: null, capacity: null });
+    const acc = (tokens: QuotaWindow | null, weekly: QuotaWindow | null): AccountQuota =>
+        ({ id: 'a', name: 'A', stale: false, error: null, quota: { tokens, weekly, monthly: null, fetchedAt: base } });
+    assert.equal(formatPool(pool(acc(window(0, null), null)), true), 'A 5h 0%／周 未提供');
+    assert.equal(formatPool(pool(acc(window(50, base + 2 * hour), window(30, new Date(2026, 9, 26, 20, 3).getTime()))), true),
+        'A 5h 50% @12:00／周 30% @10/26 20:03');
 });
 
 test('终端调试日志隐藏屏幕中出现的已知密钥，临时错误仍可续跑', async t => {

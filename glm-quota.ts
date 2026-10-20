@@ -279,6 +279,14 @@ export class QuotaMonitor {
     }
 }
 
+/** 紧凑显示的重置时刻：同一天只给时分，跨天补上月日；没有重置时间就不显示。 */
+export function formatReset(stamp: number | null, now = Date.now()): string {
+    if (stamp === null) return '';
+    const date = new Date(stamp);
+    const hm = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+    return date.toDateString() === new Date(now).toDateString() ? hm : `${date.getMonth() + 1}/${date.getDate()} ${hm}`;
+}
+
 export function formatPool(pool: PoolSnapshot, compact = false): string {
     if (pool.configError) return `GLM 额度：${pool.configError}`;
     return pool.accounts.map(account => {
@@ -286,7 +294,15 @@ export function formatPool(pool: PoolSnapshot, compact = false): string {
         const quota = account.quota;
         const display = (window: QuotaWindow | null): string => window ? `${Math.round(window.percentage)}%` : '未提供';
         const stale = account.stale ? '（查询失败，上次数据）' : '';
-        if (compact) return `${account.name} 5h ${display(quota.tokens)}／周 ${display(quota.weekly)}${stale}`;
+        if (compact) {
+            // 重置时刻回答"还剩多久恢复"；零消耗窗口接口不带重置时间，保持只显百分比。
+            const cell = (window: QuotaWindow | null): string => {
+                if (!window) return '未提供';
+                const reset = formatReset(window.nextResetTime);
+                return reset === '' ? display(window) : `${display(window)} @${reset}`;
+            };
+            return `${account.name} 5h ${cell(quota.tokens)}／周 ${cell(quota.weekly)}${stale}`;
+        }
         const lines = [`${account.name} [${account.id}]${stale}（更新 ${new Date(quota.fetchedAt).toLocaleString()}）`];
         for (const [label, window] of [['5h token window', quota.tokens], ['周额度', quota.weekly], ['MCP monthly', quota.monthly]] as const) {
             lines.push(`  ${label} : ${display(window)}` + (window?.nextResetTime ? `，重置 ${new Date(window.nextResetTime).toLocaleString()}` : ''));

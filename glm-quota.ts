@@ -94,6 +94,21 @@ export function parseQuotaResponse(body: unknown, now = Date.now()): QuotaSnapsh
     return snapshot.tokens || snapshot.weekly || snapshot.monthly ? snapshot : null;
 }
 
+/** HTTP 200 但业务码失败时给出可操作的原因；密钥抄错或被重置是"身份验证失败"最常见的情况。 */
+export function describeQuotaError(body: unknown): string {
+    if (body && typeof body === 'object') {
+        const { code, msg } = body as { code?: unknown; msg?: unknown };
+        if (typeof code === 'number' && code !== 200) {
+            const text = typeof msg === 'string' ? msg.trim() : '';
+            if (code === 1000 || /身份验证|authentication|鉴权/i.test(text)) {
+                return '额度接口鉴权失败，请检查该账号的官方 API Key';
+            }
+            return `额度接口错误 ${code}${text ? `：${text.slice(0, 60)}` : ''}`;
+        }
+    }
+    return '额度接口返回格式不正确';
+}
+
 export type Availability = { state: 'ready' | 'blocked' | 'unknown'; resetAt: number | null };
 
 export function accountAvailability(account: AccountQuota, now = Date.now()): Availability {
@@ -238,9 +253,11 @@ export class QuotaMonitor {
                     headers: { authorization: account.apiKey },
                     signal: AbortSignal.timeout(this.options.timeoutMs ?? 8000),
                 });
-                const quota = response.ok ? parseQuotaResponse(await response.json()) : null;
+                // 官方接口用 HTTP 200 携带业务错误码，正文解析失败也归入格式错误。
+                const body = response.ok ? await response.json().catch(() => null) : null;
+                const quota = parseQuotaResponse(body);
                 if (quota) return { ...publicAccount, quota, stale: false, error: null };
-                error = response.ok ? '额度接口返回格式不正确' : `额度接口 HTTP ${response.status}`;
+                error = response.ok ? describeQuotaError(body) : `额度接口 HTTP ${response.status}`;
             } catch {
                 error = '额度查询失败或超时';
             }

@@ -6,7 +6,7 @@ import * as path from 'node:path';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { QuotaMonitor, parseQuotaResponse, poolAvailability, accountAvailability, formatPool, gatewayStopReason } from '../glm-quota.js';
+import { QuotaMonitor, parseQuotaResponse, poolAvailability, accountAvailability, formatPool, gatewayStopReason, describeQuotaError } from '../glm-quota.js';
 import type { QuotaSnapshot, PoolSnapshot, AccountQuota } from '../glm-quota.js';
 
 const now = Date.now();
@@ -33,8 +33,16 @@ test('周期字段区分周、五小时及 MCP，返回顺序不影响结果', (
     assert.equal(parseQuotaResponse({ code: 200, data: { limits: [null, 'bad'] } }), null);
 });
 
-test('账号内取较晚重置，账号之间取较早恢复；MCP 不阻止模型', () => {
-    const a = account('a', [fiveHour(100, now + hour), weekly(100, now + 72 * hour)]);
+test('HTTP 200 携带业务错误码时报鉴权失败，密钥无效不再误报为格式错误', () => {
+    // 国内站与国际站对同一份密钥错误的两种真实返回。
+    assert.equal(describeQuotaError({ code: 1000, msg: '身份验证失败。', success: false }), '额度接口鉴权失败，请检查该账号的官方 API Key');
+    assert.equal(describeQuotaError({ code: 1000, msg: 'Authentication Failed', success: false }), '额度接口鉴权失败，请检查该账号的官方 API Key');
+    assert.match(describeQuotaError({ code: 500, msg: 'internal busy' }), /额度接口错误 500：internal busy/);
+    assert.equal(describeQuotaError({ code: 200, data: {} }), '额度接口返回格式不正确');
+    assert.equal(describeQuotaError(null), '额度接口返回格式不正确');
+});
+
+test('账号内取较晚重置，账号之间取较早恢复；MCP 不阻止模型', () => {    const a = account('a', [fiveHour(100, now + hour), weekly(100, now + 72 * hour)]);
     const b = account('b', [fiveHour(100, now + 2 * hour), weekly(70), monthly]);
     assert.deepEqual(accountAvailability(a, now), { state: 'blocked', resetAt: now + 72 * hour });
     assert.deepEqual(poolAvailability(pool(a, b), now), { state: 'blocked', resetAt: now + 2 * hour });
@@ -68,12 +76,17 @@ test('查询、缓存、增减账号、套餐升级及失败恢复共享同一�
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
     const requests: string[] = [];
     let fail = false;
+    let authFail = false;
     let upgraded = false;
     const server = createServer((req, res) => {
         requests.push(req.headers.authorization ?? '');
         res.setHeader('Content-Type', 'application/json');
         if (fail && req.headers.authorization === 'official-b') {
             res.writeHead(500).end('no');
+            return;
+        }
+        if (authFail && req.headers.authorization === 'official-b') {
+            res.end(JSON.stringify({ code: 1000, msg: '身份验证失败。', success: false }));
             return;
         }
         res.end(JSON.stringify(response(upgraded ? [weekly(35), fiveHour(10), monthly] : [fiveHour(100), monthly])));
@@ -100,6 +113,10 @@ test('查询、缓存、增减账号、套餐升级及失败恢复共享同一�
     assert.equal(poolAvailability(failed).state, 'unknown');
     assert.match(formatPool(failed, true), /上次数据/);
     fail = false;
+    authFail = true;
+    const denied = await monitor.read();
+    assert.match(denied.accounts[1]?.error ?? '', /鉴权失败/);
+    authFail = false;
     upgraded = true;
     assert.equal((await monitor.read()).accounts[0]?.quota?.weekly?.percentage, 35);
     rows.push({ id: 'c', name: 'c', apiKey: 'official-c', quotaUrl: rows[0]!.quotaUrl });

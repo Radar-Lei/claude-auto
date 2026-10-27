@@ -206,7 +206,10 @@ test('紧凑状态栏附带重置时刻：当天仅时分，跨天带月日，�
     const acc = (tokens: QuotaWindow | null, weekly: QuotaWindow | null): AccountQuota =>
         ({ id: 'a', name: 'A', stale: false, error: null, quota: { tokens, weekly, monthly: null, fetchedAt: base } });
     assert.equal(formatPool(pool(acc(window(0, null), null)), true), 'A 5h 0%／周 未提供');
-    assert.equal(formatPool(pool(acc(window(50, base + 2 * hour), window(30, new Date(2026, 9, 26, 20, 3).getTime()))), true),
+    // formatPool 判"今天"用的是真实时钟，取当天 12 点做当天样例，任何一天跑都成立。
+    const todayNoon = new Date();
+    todayNoon.setHours(12, 0, 0, 0);
+    assert.equal(formatPool(pool(acc(window(50, todayNoon.getTime()), window(30, new Date(2026, 9, 26, 20, 3).getTime()))), true),
         'A 5h 50% @12:00／周 30% @10/26 20:03');
 });
 
@@ -220,6 +223,8 @@ test('终端调试日志隐藏屏幕中出现的已知密钥，临时错误仍�
     const child = spawn(process.execPath, ['--import', loader, entry, '--auto-config-dir', dir, '--auto-debug'], {
         cwd: dir, stdio: 'pipe', env: {
             ...process.env, PATH: bin + path.delimiter + process.env.PATH,
+            // 从 claude-glm-auto 会话里跑测试时清掉自包裹标记，否则被测进程会拒绝启动。
+            CLAUDE_GLM_AUTO_ACTIVE: '',
             ANTHROPIC_BASE_URL: '', ANTHROPIC_AUTH_TOKEN: '', CGA_TIME_SCALE: '0.01',
             FAKE_BANNER: '● API Error: Connection closed mid-response relay-secret', FAKE_NEXT: '-',
         },

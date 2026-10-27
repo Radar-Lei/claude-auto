@@ -83,13 +83,18 @@ const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.cla
 
 const cliArgs: string[] = forwardedRest.filter(arg => !WRAPPER_FLAGS.has(arg));
 
-// Sessions start in auto mode: we forward `--permission-mode auto` by default, so
-// claude-glm-auto doesn't stop to ask on every tool call — the point of the wrapper is
-// to keep going while you're away. Three things opt out of it:
+// Sessions start with permissions fully bypassed: we forward
+// `--permission-mode bypassPermissions` by default, so claude-glm-auto never
+// stops to ask on a tool call and never trips the auto-mode permission
+// classifier — the point of the wrapper is to keep going while you're away.
+// Three things opt out of it:
 //   * --no-auto-mode, ours, for when you just want claude's own default;
 //   * an explicit --permission-mode, which is you naming a mode, so it wins;
 //   * --dangerously-skip-permissions, which claude rejects alongside a mode.
-const AUTO_MODE: string = 'auto';
+// A config dir that has never accepted bypass may show the one-time
+// confirmation on first launch; `skipDangerousModePermissionPrompt: true`
+// in that dir's settings.json pre-accepts it.
+const DEFAULT_PERMISSION_MODE: string = 'bypassPermissions';
 const PERMISSION_MODE_FLAG: string = '--permission-mode';
 const SKIP_PERMISSIONS_FLAG: string = '--dangerously-skip-permissions';
 
@@ -100,7 +105,7 @@ function permissionModeArgs(args: string[]): string[] {
         arg.startsWith(`${PERMISSION_MODE_FLAG}=`) ||
         arg === SKIP_PERMISSIONS_FLAG
     );
-    return alreadySet ? [] : [PERMISSION_MODE_FLAG, AUTO_MODE];
+    return alreadySet ? [] : [PERMISSION_MODE_FLAG, DEFAULT_PERMISSION_MODE];
 }
 
 const forwardedArgs: string[] = [...cliArgs, ...permissionModeArgs(cliArgs)];

@@ -146,12 +146,12 @@ claude-glm-auto --auto-config-dir "$HOME\.claude_glm" --install-statusline
 | `--statusline` | 输出底部状态栏，复用五分钟缓存；查询失败也输出可见提示 |
 | `--install-statusline` | 安装本机适用的底部状态栏命令 |
 | `--install-alias` / `--uninstall-alias` | 管理 `claude` 的 shell 别名 |
-| `--no-auto-mode` | 不默认传递 `--permission-mode auto` |
+| `--no-auto-mode` | 不默认传递 `--permission-mode bypassPermissions` |
 | `--auto-debug` | 将屏幕与恢复决策写入工作目录的 `claude-glm-auto.log` |
 | `GLM_QUOTA_URL` | 覆盖所有账号的额度接口，主要用于本地模拟测试 |
 | `CGA_TIME_SCALE` | 测试用时间缩放系数，默认 1 |
 
-普通会话默认向 Claude Code 传递 `--permission-mode auto`。显式指定权限模式，或使用 `--dangerously-skip-permissions` 时，沿用你的选择。
+普通会话默认向 Claude Code 传递 `--permission-mode bypassPermissions`，避免离线续跑时卡在权限确认或 auto 模式权限分类器上。显式指定权限模式，或使用 `--dangerously-skip-permissions` 时，沿用你的选择。从未接受过 bypass 的配置目录首次启动可能弹一次性确认，在该目录 settings.json 里加 `skipDangerousModePermissionPrompt: true` 可预先跳过。
 
 ## 开发与验证
 
